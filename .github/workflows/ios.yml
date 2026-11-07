@@ -1,0 +1,44 @@
+name: iOS Build & Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ApexCam Pro (iOS 18)
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Select Xcode (latest stable)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - name: Show Xcode version
+        run: xcodebuild -version
+      - name: Build
+        run: |
+          xcodebuild build -project ApexCam.xcodeproj -scheme ApexCam -destination "generic/platform=iOS" -derivedDataPath build/DerivedData CODE_SIGNING_ALLOWED=NO
+      - name: Archive and package unsigned IPA
+        run: |
+          xcodebuild archive -project ApexCam.xcodeproj -scheme ApexCam -configuration Release -destination "generic/platform=iOS" -archivePath build/ApexCam.xcarchive CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY=""
+          mkdir -p build/Payload
+          cp -R build/ApexCam.xcarchive/Products/Applications/ApexCam.app build/Payload/
+          cd build && zip -qry ApexCam-unsigned.ipa Payload
+          ls -lh ApexCam-unsigned.ipa
+      - name: Verify IPA contents
+        run: |
+          test -d build/Payload/ApexCam.app && echo "App bundle present ✓"
+          test ! -d build/Payload/ApexCam.app/PlugIns && echo "No extensions ship ✓"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" build/Payload/ApexCam.app/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" build/Payload/ApexCam.app/Info.plist | grep -q "com.apexcam.pro" && echo "Bundle id ✓"
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ApexCam-IPA
+          path: build/ApexCam-unsigned.ipa
+          if-no-files-found: error
