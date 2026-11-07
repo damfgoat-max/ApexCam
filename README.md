@@ -13,5 +13,8 @@ A free, offline, no-ads pro camera app for iPhone (iOS 18), built to be **very u
 
 Hardware honesty: an app can't add a bigger sensor, a real EVF, a tilting screen, weather sealing, or physical dials — ApexCam uses the software equivalents (your iPhone's built-in sensor-shift stabilization, live exposure preview, on-screen dials, dual-save backup).
 
+## Magic Tools — only in ApexCam
+Motion-trigger Auto-Capture, Smile/Face Auto Shutter, Clap/Sound Shutter, Vlog Teleprompter, Timelapse + Stop-Motion (onion skin), Face ID Private Vault, built-in Edit Studio (CoreImage filters + brightness/contrast), rule-based on-device Coach Tips, approximate Golden Hour badge, and GPS EXIF Location Stamp. All off by default except Coach Tips, all under **Tools > Magic Tools** with plain-English explanations.
+
 ## Install (unsigned IPA)
 Builds run in GitHub Actions and produce `ApexCam-unsigned.ipa` (unsigned — needs re-signing to install, e.g. Sideloadly on a Mac: put the IPA on the Desktop/Downloads first, not in Messages Attachments). Compile success in CI does **not** prove on-device camera behavior — test on the phone.

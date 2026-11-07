@@ -3,6 +3,8 @@ import AVFoundation
 import Photos
 import UIKit
 import CoreMotion
+import CoreLocation
+import ImageIO
 
 enum CameraPreset: String, CaseIterable, Identifiable {
     case auto = "Auto", sports = "Sports", portrait = "Portrait", night = "Night", vlog = "Vlog", macro = "Macro", video = "Video"
@@ -57,6 +59,19 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var lastSavedTick = 0               // bump to refresh gallery
     @Published var supportsRAW = false
     @Published var isTorchOn = false
+    @Published var latitude: Double? = nil
+
+    // Magic Tools
+    var motionAutoCapture = false
+    var smileAutoCapture = false
+    var locationStamp = false
+    private var lastAvgLuma: Double = -1
+    private var lastAutoShot = Date.distantPast
+    private var faceFirstSeen: Date? = nil
+    private var audioRecorder: AVAudioRecorder?
+    private var meterTimer: Timer?
+    private let locationManager = CLLocationManager()
+    private(set) var lastLocation: CLLocation? = nil
 
     var dualSave = true
     var batterySaver = false { didSet { applyBatterySaver() } }
@@ -83,7 +98,64 @@ final class CameraManager: NSObject, ObservableObject {
         }
         startLevel()
         observeVolume()
+        locationManager.delegate = self
+        locationManager.desiredAccuracy = kCLLocationAccuracyKilometer
     }
+
+    // MARK: Location stamp (EXIF GPS)
+    func setLocationStamp(_ on: Bool) {
+        locationStamp = on
+        if on {
+            locationManager.requestWhenInUseAuthorization()
+            locationManager.requestLocation()
+        }
+    }
+
+    // MARK: Clap / sound shutter (mic metering, best effort)
+    func setSoundShutter(_ on: Bool) {
+        if on {
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("apex-meter.caf")
+            let settings: [String: Any] = [AVFormatIDKey: kAudioFormatAppleLossless, AVSampleRateKey: 44100, AVNumberOfChannelsKey: 1]
+            do {
+                audioRecorder = try AVAudioRecorder(url: url, settings: settings)
+                audioRecorder?.isMeteringEnabled = true
+                audioRecorder?.record()
+                meterTimer?.invalidate()
+                meterTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+                    guard let self, let r = self.audioRecorder, !self.isRecording else { return }
+                    r.updateMeters()
+                    if r.averagePower(forChannel: 0) > -10, Date().timeIntervalSince(self.lastAutoShot) > 3 {
+                        self.lastAutoShot = Date()
+                        DispatchQueue.main.async { self.statusMessage = "👏 Clap heard — shot taken!" }
+                        self.capturePhoto()
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async { self.statusMessage = "Sound shutter couldn't start the mic meter on this phone." }
+            }
+        } else {
+            meterTimer?.invalidate(); audioRecorder?.stop(); audioRecorder = nil
+        }
+    }
+
+    private func embedGPS(into data: Data) -> Data {
+        guard locationStamp, let loc = lastLocation,
+              let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let type = CGImageSourceGetType(src),
+              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return data }
+        let out = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(out, type, 1, nil) else { return data }
+        let lat = loc.coordinate.latitude, lon = loc.coordinate.longitude
+        let gps: [String: Any] = [
+            kCGImagePropertyGPSLatitude as String: abs(lat),
+            kCGImagePropertyGPSLatitudeRef as String: lat >= 0 ? "N" : "S",
+            kCGImagePropertyGPSLongitude as String: abs(lon),
+            kCGImagePropertyGPSLongitudeRef as String: lon >= 0 ? "E" : "W",
+        ]
+        CGImageDestinationAddImage(dest, cg, [kCGImagePropertyGPSDictionary as String: gps] as CFDictionary)
+        return CGImageDestinationFinalize(dest) ? (out as Data) : data
+    }
+
 
     // MARK: Permissions / setup
     func requestAndConfigure() {
@@ -406,7 +478,8 @@ final class CameraManager: NSObject, ObservableObject {
     func stopRecording() { sessionQueue.async { if self.movieOutput.isRecording { self.movieOutput.stopRecording() } } }
 
     // MARK: Saving (Photos + optional Vault dual-save)
-    fileprivate func savePhotoData(_ data: Data, isRAW: Bool) {
+    fileprivate func savePhotoData(_ dataIn: Data, isRAW: Bool) {
+        let data = isRAW ? dataIn : embedGPS(into: dataIn)
         let ext = isRAW ? "dng" : "jpg"
         let name = "ApexCam-\(Int(Date().timeIntervalSince1970)).\(ext)"
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(name)
@@ -488,6 +561,7 @@ extension CameraManager: AVCaptureMetadataOutputObjectsDelegate {
         guard let layer = previewLayer,
               let face = metadataObjects.first(where: { $0.type == .face }),
               let transformed = layer.transformedMetadataObject(for: face) else {
+            DispatchQueue.main.async { self.faceFirstSeen = nil }
             if trackingOn { DispatchQueue.main.async { self.trackedRect = nil } }
             return
         }
@@ -500,6 +574,14 @@ extension CameraManager: AVCaptureMetadataOutputObjectsDelegate {
         DispatchQueue.main.async {
             self.trackedRect = normalized
             if self.trackingOn { self.focusDevicePoint(devicePoint) }
+            if self.smileAutoCapture {
+                if self.faceFirstSeen == nil { self.faceFirstSeen = Date() }
+                if let since = self.faceFirstSeen, Date().timeIntervalSince(since) > 1.0, Date().timeIntervalSince(self.lastAutoShot) > 3.5, !self.isRecording {
+                    self.lastAutoShot = Date(); self.faceFirstSeen = nil
+                    self.statusMessage = "😊 Face steady — auto shot!"
+                    self.capturePhoto()
+                }
+            }
         }
     }
 }
@@ -530,7 +612,28 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
             y += 24
         }
         guard count > 0 else { return }
+        let avg = bins.enumerated().reduce(0.0) { $0 + $1.element * Double($1.offset * 16 + 8) / max(count, 1) } / 255.0
+        if motionAutoCapture, lastAvgLuma >= 0, abs(avg - lastAvgLuma) > 0.045, Date().timeIntervalSince(lastAutoShot) > 3.5, !isRecording {
+            lastAutoShot = Date()
+            DispatchQueue.main.async { self.statusMessage = "🏃 Motion seen — auto shot!" }
+            capturePhoto()
+        }
+        lastAvgLuma = avg
         let normalized = bins.map { $0 / count }
         DispatchQueue.main.async { self.histogram = normalized }
+    }
+}
+
+
+extension CameraManager: CLLocationManagerDelegate {
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        lastLocation = locations.last
+        if let c = locations.last?.coordinate { DispatchQueue.main.async { self.latitude = c.latitude } }
+    }
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) { }
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        if locationStamp, manager.authorizationStatus == .authorizedWhenInUse || manager.authorizationStatus == .authorizedAlways {
+            manager.requestLocation()
+        }
     }
 }

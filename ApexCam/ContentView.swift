@@ -33,6 +33,23 @@ struct ContentView: View {
     @State private var fps: Double = 30
     @State private var countdown = 0
 
+    // Magic Tools
+    @State private var motionAuto = false
+    @State private var smileAuto = false
+    @State private var soundAuto = false
+    @State private var coachOn = true
+    @State private var prompterOn = false
+    @State private var prompterText = "Hey everyone! Welcome back to my video. Today we're checking out something awesome — let's get into it!"
+    @State private var prompterSpeed: Double = 1
+    @State private var prompterOffset: CGFloat = 260
+    @State private var timelapseOn = false
+    @State private var timelapseInterval: Double = 2
+    @State private var timelapseFrames = 0
+    @State private var tlTimer: Timer? = nil
+    @State private var stopMotionOn = false
+    @State private var onionImage: UIImage? = nil
+    @State private var locationStampOn = false
+
     private var big: CGFloat { rainMode ? 1.35 : 1.0 }
 
     var body: some View {
@@ -71,7 +88,14 @@ struct ContentView: View {
                         .foregroundStyle(.white)
                         .onTapGesture { cam.statusMessage = nil }
                 }
+                if coachOn { coachBar }
                 Spacer()
+                if prompterOn { teleprompter }
+                if stopMotionOn, let img = onionImage {
+                    Image(uiImage: img).resizable().scaledToFill().opacity(0.35).ignoresSafeArea()
+                        .overlay(alignment: .top) { Text("STOP-MOTION — line up with the ghost of your last frame").font(.caption2.bold()).padding(6).background(.black.opacity(0.6), in: Capsule()).padding(.top, 120) }
+                        .allowsHitTesting(false)
+                }
                 if proMode { proPanel }
                 presetRow
                 shutterRow
@@ -86,6 +110,12 @@ struct ContentView: View {
             }
         }
         .foregroundStyle(.white)
+        .onChange(of: cam.lastSavedTick) { _, _ in
+            if stopMotionOn, let newest = (try? FileManager.default.contentsOfDirectory(at: CameraManager.vaultURL(), includingPropertiesForKeys: nil))?
+                .filter({ ["jpg", "jpeg", "heic"].contains($0.pathExtension.lowercased()) })
+                .sorted(by: { $0.lastPathComponent > $1.lastPathComponent }).first,
+               let img = UIImage(contentsOfFile: newest.path) { onionImage = img }
+        }
         .sheet(isPresented: $showTools) { toolsSheet }
         .sheet(isPresented: $showGallery) { GalleryView(manager: cam) }
         .sheet(isPresented: $showHelp) { HelpView() }
@@ -264,6 +294,66 @@ struct ContentView: View {
         }
     }
 
+    private var brightness: Double { cam.histogram.enumerated().reduce(0) { $0 + $1.element * Double($1.offset * 16 + 8) } / 255.0 }
+    private var coachTip: String {
+        if brightness > 0 && brightness < 0.22 { return "💡 Coach: Too dark — tap the torch (flashlight button) or use the Night preset." }
+        if cam.trackedRect != nil { return "💡 Coach: Face found — you're in focus. Shoot!" }
+        if abs(cam.levelDegrees) > 4 { return "💡 Coach: Level your shot — tilt the phone until the line turns green." }
+        if brightness > 0.85 { return "💡 Coach: Very bright — try EV −1 in PRO so highlights don't blow out." }
+        return "💡 Coach: Looks good — steady hands, shoot away."
+    }
+    private var coachBar: some View {
+        HStack(spacing: 8) {
+            Text(coachTip).font(.caption.bold())
+            Spacer()
+            if preset == .auto { Text(goldenBadge).font(.caption2.bold()).padding(.horizontal, 7).padding(.vertical, 4).background(Color.orange.opacity(0.85), in: Capsule()) }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 7)
+        .background(.black.opacity(0.6), in: Capsule())
+    }
+    private var goldenBadge: String {
+        // Approx sunset from day-of-year + coarse latitude (solar math, no exact location needed)
+        let cal = Calendar.current
+        let n = Double(cal.ordinality(of: .day, in: .year, for: Date()) ?? 172)
+        let lat = (cam.latitude ?? 39.0) * Double.pi / 180
+        let decl = -23.44 * Double.pi / 180 * cos(2 * Double.pi / 365 * (n + 10))
+        let cosH = min(max((cos(90.833 * Double.pi / 180) - sin(lat) * sin(decl)) / (cos(lat) * cos(decl)), -1), 1)
+        let sunset = 12 + acos(cosH) * 180 / Double.pi / 15  // local solar time, approx
+        let golden = sunset - 1
+        let h = Int(golden), m = Int((golden - Double(h)) * 60)
+        let hour12 = h > 12 ? h - 12 : max(h, 1)
+        return "🌅 Golden hour ~\(hour12):\(String(format: "%02d", m)) PM (approx)"
+    }
+    private var teleprompter: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 14).fill(.black.opacity(0.55)).frame(height: 190)
+            Text(prompterText)
+                .font(.title3.bold()).multilineTextAlignment(.center)
+                .frame(width: 300).offset(y: prompterOffset)
+                .clipped()
+        }
+        .frame(height: 190)
+        .onAppear {
+            prompterOffset = 130
+            Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { t in
+                if !prompterOn { t.invalidate(); return }
+                prompterOffset -= CGFloat(prompterSpeed) * 0.7
+                if prompterOffset < -320 { prompterOffset = 130 }
+            }
+        }
+    }
+
+    private func toggleTimelapse(_ on: Bool) {
+        tlTimer?.invalidate(); tlTimer = nil
+        if on {
+            timelapseFrames = 0
+            tlTimer = Timer.scheduledTimer(withTimeInterval: timelapseInterval, repeats: true) { _ in
+                cam.capturePhoto(); timelapseFrames += 1
+            }
+            cam.statusMessage = "⏱️ Timelapse running — frames save to your Gallery/Vault. Turn it off in Tools."
+        }
+    }
+
     // MARK: Pro panel
     private var proPanel: some View {
         VStack(spacing: 8) {
@@ -322,6 +412,32 @@ struct ContentView: View {
                         .onChange(of: batterySaver) { _, v in cam.batterySaver = v }
                     Toggle("Subject Tracking", isOn: Binding(get: { cam.trackingOn }, set: { cam.trackingOn = $0 }))
                 }
+                Section {
+                    Toggle("🏃 Auto-Capture — camera shoots itself when the action happens", isOn: $motionAuto)
+                        .onChange(of: motionAuto) { _, v in cam.motionAutoCapture = v }
+                    Toggle("😊 Smile / Face Auto Shutter — face steady for 1 sec = photo", isOn: $smileAuto)
+                        .onChange(of: smileAuto) { _, v in cam.smileAutoCapture = v }
+                    Toggle("👏 Clap / Sound Shutter — loud sound takes the photo", isOn: $soundAuto)
+                        .onChange(of: soundAuto) { _, v in cam.setSoundShutter(v) }
+                    Toggle("💡 Coach Tips — live plain-English shooting tips", isOn: $coachOn)
+                    Toggle("📍 Location Stamp — writes GPS into photo info (EXIF)", isOn: $locationStampOn)
+                        .onChange(of: locationStampOn) { _, v in cam.setLocationStamp(v) }
+                    Toggle("⏱️ Timelapse — auto photo every few seconds", isOn: $timelapseOn)
+                        .onChange(of: timelapseOn) { _, v in toggleTimelapse(v) }
+                    if timelapseOn {
+                        Picker("Every", selection: $timelapseInterval) {
+                            Text("0.5s").tag(0.5); Text("1s").tag(1.0); Text("2s").tag(2.0); Text("5s").tag(5.0)
+                        }.onChange(of: timelapseInterval) { _, _ in if timelapseOn { toggleTimelapse(true) } }
+                        Text("Frames so far: \(timelapseFrames) — find them in the Gallery.").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Toggle("🎬 Stop-Motion — ghost of your last frame to line up the next", isOn: $stopMotionOn)
+                } header: { Text("✨ Magic Tools — Only in ApexCam") }
+                Section {
+                    Toggle("Show teleprompter over the camera (great for Vlog)", isOn: $prompterOn)
+                    TextEditor(text: $prompterText).frame(height: 90)
+                    HStack { Text("Scroll speed").font(.caption); Slider(value: $prompterSpeed, in: 0.3...3) }
+                    Text("Tip: use the Vlog preset (front camera), turn this on, and read while you record.").font(.caption).foregroundStyle(.secondary)
+                } header: { Text("📜 Vlog Teleprompter") }
                 Section("Look of the shot") {
                     Toggle("Grid (rule of thirds)", isOn: $showGrid)
                     Toggle("Level (keep it straight)", isOn: $showLevel)
