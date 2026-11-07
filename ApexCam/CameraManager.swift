@@ -59,12 +59,26 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var lastSavedTick = 0               // bump to refresh gallery
     @Published var supportsRAW = false
     @Published var needsSampleBuffer = false   // true while histogram/motion/smile tools need the data output
+    @Published var healthText = "● STARTING"   // v3 watchdog: ● LIVE / ● STARTING / ● STALLED (leaf-view only)
     private var isConfiguring = false          // configure-once guard (a)
     private var dataOutputAttached = false     // lazy data output state (c)
     private var histogramVisible = false       // publish histogram only when its tool is on screen (b)
     private var requestedVideoFPS: Double? = nil  // non-nil only while a video format is active (f)
     private var lastPublishedLevel: Double = 0
+    private var lastLevelPublishTime = Date.distantPast
     private let motionQueue = OperationQueue()
+    // v3 watchdog / heartbeat state
+    private var lastMetadataHeartbeat = Date.distantPast   // written on the metadata delegate queue
+    private var healthTimer: Timer? = nil
+    private var sessionStartedAt = Date.distantPast        // for the volume-KVO launch guard
+    private var restartGraceUntil = Date.distantPast
+    private var restartedOnceThisStall = false
+    private var rebuiltThisStall = false
+    private(set) var captureInFlight = false               // volume-KVO guard during captures
+    // v3 metadata-delegate dedup state (delegate queue only)
+    private var metaLastFacePresent = false
+    private var metaLastPostedRect: CGRect? = nil
+    private var metaLastRectPostTime = Date.distantPast
     @Published var isTorchOn = false
     @Published var latitude: Double? = nil
 
@@ -107,6 +121,29 @@ final class CameraManager: NSObject, ObservableObject {
         observeVolume()
         locationManager.delegate = self
         locationManager.desiredAccuracy = kCLLocationAccuracyKilometer
+        // v3: session health observers — a runtime error or a finished interruption
+        // runs the same self-restart path as the watchdog.
+        let nc = NotificationCenter.default
+        nc.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: nil) { [weak self] _ in
+            self?.handleSessionFailure("Camera hit an error and restarted itself.")
+        }
+        nc.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: session, queue: nil) { [weak self] _ in
+            self?.restartGraceUntil = Date().addingTimeInterval(6)
+        }
+        nc.addObserver(forName: AVCaptureSession.interruptionEndedNotification, object: session, queue: nil) { [weak self] _ in
+            self?.handleSessionFailure("Camera was interrupted and restarted itself.")
+        }
+        // v3 (8): when the subject area changes (device moved a lot), re-center AF/AE.
+        nc.addObserver(forName: AVCaptureDevice.subjectAreaDidChangeNotification, object: nil, queue: nil) { [weak self] note in
+            guard let self, let dev = note.object as? AVCaptureDevice, dev === self.currentDevice else { return }
+            self.sessionQueue.async { self.applyCenterFocusExposureOnSessionQueue() }
+        }
+    }
+
+    // Shared failure path for runtime errors / interruptions: simple restart first.
+    private func handleSessionFailure(_ message: String) {
+        DispatchQueue.main.async { self.statusMessage = message }
+        restartSession(rebuild: false)
     }
 
     // MARK: Location stamp (EXIF GPS)
@@ -169,6 +206,7 @@ final class CameraManager: NSObject, ObservableObject {
         // v2 (a): no-op if already configured or a configure is already in flight.
         guard !isConfigured, !isConfiguring else { return }
         isConfiguring = true
+        startWatchdogIfNeeded()
         AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
             guard let self else { return }
             if !granted {
@@ -226,13 +264,37 @@ final class CameraManager: NSObject, ObservableObject {
         // v2 (h): explicitly put the device in full system-auto (focus/exposure/WB) at
         // launch so no custom exposure state leaks into the first shot.
         applyAutoOnSessionQueue()
+        // v3 (8): center AF/AE + smooth AF + subject-area monitoring, so the first
+        // frame isn't the dark/defocused one from the user's screenshot.
+        applyCenterFocusExposureOnSessionQueue()
         let rawOK = !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty
         isConfiguring = false
         DispatchQueue.main.async {
             self.supportsRAW = rawOK
             self.isConfigured = true
         }
-        if !session.isRunning { session.startRunning() }
+        restartGraceUntil = Date().addingTimeInterval(4)
+        if !session.isRunning { session.startRunning(); sessionStartedAt = Date() }
+    }
+
+    // v3 (8): must be called on sessionQueue. Center focus/exposure with continuous
+    // modes, smooth AF when the device offers it, and subject-area change monitoring
+    // (the observer registered in init re-runs this when the subject area changes).
+    private func applyCenterFocusExposureOnSessionQueue() {
+        guard let device = currentDevice else { return }
+        try? device.lockForConfiguration()
+        let center = CGPoint(x: 0.5, y: 0.5)
+        if device.isFocusPointOfInterestSupported {
+            device.focusPointOfInterest = center
+            if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
+        }
+        if device.isExposurePointOfInterestSupported {
+            device.exposurePointOfInterest = center
+            if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+        }
+        if device.isSmoothAutoFocusSupported { device.isSmoothAutoFocusEnabled = true }
+        device.isSubjectAreaChangeMonitoringEnabled = true
+        device.unlockForConfiguration()
     }
 
     // Largest maxPhotoDimensions the active format supports (guarded).
@@ -269,13 +331,94 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    func startRunning() { sessionQueue.async { if !self.session.isRunning { self.session.startRunning() } } }
+    func startRunning() {
+        sessionQueue.async {
+            if !self.session.isRunning { self.session.startRunning(); self.sessionStartedAt = Date() }
+        }
+    }
     func stopRunning() { sessionQueue.async { if self.session.isRunning { self.session.stopRunning() } } }
+
+    // v3 (9): lifecycle resume — scenePhase .active restarts a configured session.
+    func resumeIfConfigured() {
+        guard isConfigured else { return }
+        startRunning()
+    }
+
+    // v3 (6): manual restart from the health pill / Tools sheet.
+    func manualRestartCamera() {
+        restartedOnceThisStall = false
+        rebuiltThisStall = false
+        DispatchQueue.main.async { self.statusMessage = "Restarting the camera…" }
+        restartSession(rebuild: false)
+    }
+
+    // v3 (6): restart path. Simple: stop/start. Rebuild: tear the session down to
+    // empty and re-run the whole configure (the preview layer keeps this same
+    // session object, so the picture comes back on its own).
+    func restartSession(rebuild: Bool) {
+        restartGraceUntil = Date().addingTimeInterval(5)
+        DispatchQueue.main.async { if self.isConfigured { self.healthText = "● STARTING" } }
+        sessionQueue.async {
+            if self.session.isRunning { self.session.stopRunning() }
+            if rebuild {
+                self.session.beginConfiguration()
+                for input in self.session.inputs { self.session.removeInput(input) }
+                for output in self.session.outputs { self.session.removeOutput(output) }
+                self.session.commitConfiguration()
+                self.videoInput = nil; self.audioInput = nil
+                self.dataOutputAttached = false
+                self.isConfiguring = false
+                DispatchQueue.main.async { self.isConfigured = false }
+                // requestAndConfigure flips isConfiguring itself; do it after the
+                // published flag clears so its guard passes.
+                DispatchQueue.main.async { self.requestAndConfigure() }
+            } else {
+                self.session.startRunning()
+                self.sessionStartedAt = Date()
+            }
+        }
+    }
+
+    // v3 (6): 1-second watchdog. The metadata delegate stamps lastMetadataHeartbeat
+    // on its own queue; if callbacks stop while configured, the session is stalled:
+    // restart once, then escalate to a full rebuild if it stalls again.
+    private func startWatchdogIfNeeded() {
+        guard healthTimer == nil else { return }
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let now = Date()
+            if self.isConfiguring || !self.isConfigured {
+                if self.healthText != "● STARTING" { self.healthText = "● STARTING" }
+                return
+            }
+            if now < self.restartGraceUntil {
+                if self.healthText != "● STARTING" { self.healthText = "● STARTING" }
+                return
+            }
+            let age = now.timeIntervalSince(self.lastMetadataHeartbeat)
+            if age < 1.5 {
+                if self.healthText != "● LIVE" { self.healthText = "● LIVE" }
+                self.restartedOnceThisStall = false
+                self.rebuiltThisStall = false
+            } else if age > 2.5 {
+                if self.healthText != "● STALLED" { self.healthText = "● STALLED" }
+                if !self.restartedOnceThisStall {
+                    self.restartedOnceThisStall = true
+                    self.statusMessage = "Camera stalled — restarting it…"
+                    self.restartSession(rebuild: false)
+                } else if !self.rebuiltThisStall {
+                    self.rebuiltThisStall = true
+                    self.statusMessage = "Camera still stalled — rebuilding it…"
+                    self.restartSession(rebuild: true)
+                }
+            }
+        }
+    }
 
     // MARK: Level (CoreMotion)
     private func startLevel() {
         guard motion.isDeviceMotionAvailable else { return }
-        motion.deviceMotionUpdateInterval = 0.15
+        motion.deviceMotionUpdateInterval = 0.25
         motionQueue.name = "apexcam.motion"
         motionQueue.maxConcurrentOperationCount = 1
         motion.startDeviceMotionUpdates(to: motionQueue) { [weak self] m, _ in
@@ -284,10 +427,13 @@ final class CameraManager: NSObject, ObservableObject {
             var deg = roll * 180 / Double.pi
             if deg > 90 { deg -= 180 }; if deg < -90 { deg += 180 }
             let rounded = deg.rounded()
-            // v2 (b): only publish when the rounded value actually moved >= 1 degree,
-            // so the UI is not re-rendered several times a second forever.
-            guard abs(rounded - self.lastPublishedLevel) >= 1 else { return }
+            // v3 (2): publish at most ~4x/sec and only on a >= 2 degree change;
+            // the level now lives in a leaf view, but keep the publish rate low too.
+            let now = Date()
+            guard abs(rounded - self.lastPublishedLevel) >= 2,
+                  now.timeIntervalSince(self.lastLevelPublishTime) >= 0.25 else { return }
             self.lastPublishedLevel = rounded
+            self.lastLevelPublishTime = now
             DispatchQueue.main.async { self.levelDegrees = rounded }
         }
     }
@@ -301,6 +447,10 @@ final class CameraManager: NSObject, ObservableObject {
         volumeObservation = audio.observe(\.outputVolume, options: [.new]) { [weak self] _, change in
             guard let self, let v = change.newValue, v != last else { return }
             last = v
+            // v3 (5): the capture session itself moves outputVolume when it starts —
+            // ignore changes in the first 3s after start and during a capture, or
+            // the app takes (or interferes with) photos all by itself.
+            guard Date().timeIntervalSince(self.sessionStartedAt) > 3, !self.captureInFlight else { return }
             DispatchQueue.main.async {
                 if self.isRecording { self.stopRecording() } else { self.capturePhoto() }
             }
@@ -319,7 +469,10 @@ final class CameraManager: NSObject, ObservableObject {
             if self.session.canAddInput(input) { self.session.addInput(input); self.videoInput = input; self.currentDevice = device }
             self.session.commitConfiguration()
             self.updateMaxPhotoDimensions(for: device)
-            DispatchQueue.main.async { self.isFront = (target == .front); self.trackedRect = nil; self.trackingOn = false }
+            DispatchQueue.main.async {
+                self.isFront = (target == .front); self.trackedRect = nil; self.trackingOn = false
+                self.metaLastFacePresent = false; self.metaLastPostedRect = nil  // v3: re-post fresh after a flip
+            }
             // Photo mode keeps the system format after a flip; only re-apply a custom
             // format if the user is actually in a video/fps selection right now.
             if let fps = self.requestedVideoFPS { self.selectBestVideoFormat(fps: fps) }
@@ -534,7 +687,7 @@ final class CameraManager: NSObject, ObservableObject {
 
     private func applyBatterySaver() {
         // Throttles tool updates; preview stays live. (Full fps change is format-dependent and guarded out for recording safety.)
-        motion.deviceMotionUpdateInterval = batterySaver ? 0.4 : 0.15
+        motion.deviceMotionUpdateInterval = batterySaver ? 0.5 : 0.25
     }
 
     // MARK: Photo capture
@@ -558,6 +711,7 @@ final class CameraManager: NSObject, ObservableObject {
             if let conn = self.photoOutput.connection(with: .video), conn.isVideoOrientationSupported {
                 conn.videoOrientation = .portrait
             }
+            self.captureInFlight = true   // v3 (5): cleared in the photo delegate, incl. errors
             self.photoOutput.capturePhoto(with: s, delegate: self)
         }
     }
@@ -641,6 +795,14 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
             DispatchQueue.main.async { self.statusMessage = "That shot didn't save — try again." }
         }
     }
+    // v3 (5): always the last callback for a capture, success or error — the
+    // volume-shutter guard flag is cleared here so it can never get stuck on.
+    func photoOutput(_ output: AVCapturePhotoOutput, didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings, error: Error?) {
+        captureInFlight = false
+        if error != nil {
+            DispatchQueue.main.async { self.statusMessage = "That shot didn't work — try again." }
+        }
+    }
 }
 
 extension CameraManager: AVCaptureFileOutputRecordingDelegate {
@@ -658,32 +820,63 @@ extension CameraManager: AVCaptureFileOutputRecordingDelegate {
 }
 
 extension CameraManager: AVCaptureMetadataOutputObjectsDelegate {
+    // v3 (3)+(6): runs on the apexcam.meta queue. Every callback stamps the
+    // watchdog heartbeat. Main-queue posts happen ONLY when something actually
+    // changed, throttled to ~15fps — a no-face/no-change callback touches no
+    // queue but this one.
     func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
-        guard let layer = previewLayer,
-              let face = metadataObjects.first(where: { $0.type == .face }),
+        lastMetadataHeartbeat = Date()
+        let face = metadataObjects.first(where: { $0.type == .face })
+        guard let face, let layer = previewLayer,
               let transformed = layer.transformedMetadataObject(for: face) else {
-            DispatchQueue.main.async { self.faceFirstSeen = nil }
-            if trackingOn { DispatchQueue.main.async { self.trackedRect = nil } }
+            // No face: clear local state here; post trackedRect=nil to main ONCE,
+            // only if a face was previously present.
+            faceFirstSeen = nil
+            if metaLastFacePresent {
+                metaLastFacePresent = false
+                metaLastPostedRect = nil
+                DispatchQueue.main.async { self.trackedRect = nil }
+            }
             return
         }
         let b = layer.bounds
         guard b.width > 0, b.height > 0 else { return }
         let r = transformed.bounds
         let normalized = CGRect(x: r.minX / b.width, y: r.minY / b.height, width: r.width / b.width, height: r.height / b.height)
-        let centerLayer = CGPoint(x: r.midX, y: r.midY)
-        let devicePoint = layer.captureDevicePointConverted(fromLayerPoint: centerLayer)
-        DispatchQueue.main.async {
-            self.trackedRect = normalized
-            if self.trackingOn { self.focusDevicePoint(devicePoint) }
-            if self.smileAutoCapture {
-                if self.faceFirstSeen == nil { self.faceFirstSeen = Date() }
-                if let since = self.faceFirstSeen, Date().timeIntervalSince(since) > 1.0, Date().timeIntervalSince(self.lastAutoShot) > 3.5, !self.isRecording {
-                    self.lastAutoShot = Date(); self.faceFirstSeen = nil
-                    self.statusMessage = "😊 Face steady — auto shot!"
-                    self.capturePhoto()
-                }
+
+        // Smile auto-shutter: entirely on this queue. capturePhoto() hops to
+        // sessionQueue itself, so no main bounce is needed except the message.
+        if smileAutoCapture {
+            if faceFirstSeen == nil { faceFirstSeen = Date() }
+            if let since = faceFirstSeen, Date().timeIntervalSince(since) > 1.0,
+               Date().timeIntervalSince(lastAutoShot) > 3.5, !isRecording {
+                lastAutoShot = Date(); faceFirstSeen = nil
+                DispatchQueue.main.async { self.statusMessage = "😊 Face steady — auto shot!" }
+                capturePhoto()
             }
+        } else {
+            faceFirstSeen = nil
         }
+
+        // Tracking focus follows the face — focusDevicePoint hops to sessionQueue.
+        if trackingOn {
+            let centerLayer = CGPoint(x: r.midX, y: r.midY)
+            focusDevicePoint(layer.captureDevicePointConverted(fromLayerPoint: centerLayer))
+        }
+
+        // Post the rect only on meaningful movement, at most ~15fps.
+        let now = Date()
+        let moved: Bool
+        if let last = metaLastPostedRect {
+            moved = abs(normalized.midX - last.midX) > 0.01 || abs(normalized.midY - last.midY) > 0.01
+                || abs(normalized.width - last.width) > 0.01 || abs(normalized.height - last.height) > 0.01
+        } else { moved = true }
+        let firstAppearance = !metaLastFacePresent
+        metaLastFacePresent = true
+        guard (moved || firstAppearance), now.timeIntervalSince(metaLastRectPostTime) > 0.066 else { return }
+        metaLastRectPostTime = now
+        metaLastPostedRect = normalized
+        DispatchQueue.main.async { self.trackedRect = normalized }
     }
 }
 

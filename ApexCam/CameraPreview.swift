@@ -12,8 +12,14 @@ struct CameraPreview: UIViewRepresentable {
         return v
     }
     func updateUIView(_ uiView: PreviewView, context: Context) {
-        manager.previewLayer = uiView.previewLayer
-        if let conn = uiView.previewLayer.connection, conn.isVideoOrientationSupported {
+        // v3 (10): this runs on every SwiftUI update — keep it nearly free. Only
+        // touch the layer reference when the instance actually changed, and only
+        // set the connection orientation when it differs.
+        if manager.previewLayer !== uiView.previewLayer {
+            manager.previewLayer = uiView.previewLayer
+        }
+        if let conn = uiView.previewLayer.connection, conn.isVideoOrientationSupported,
+           conn.videoOrientation != .portrait {
             conn.videoOrientation = .portrait
         }
     }

@@ -3,6 +3,7 @@ import AVFoundation
 
 struct ContentView: View {
     @StateObject private var cam = CameraManager()
+    @Environment(\.scenePhase) private var scenePhase
     @AppStorage("apexOnboarded") private var onboarded = false
     @State private var preset: CameraPreset = .auto
     @State private var proMode = false
@@ -86,8 +87,17 @@ struct ContentView: View {
         .onChange(of: prompterOn) { _, on in
             if !on { prompterTimer?.invalidate(); prompterTimer = nil }
         }
+        // v3 (9): lifecycle is driven by scenePhase, NOT the root view's
+        // onDisappear — sheets and onboarding swaps made onDisappear stop the
+        // camera at the wrong times. Background/inactive stops; active resumes.
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .active: cam.resumeIfConfigured()
+            case .background, .inactive: cam.stopRunning()
+            @unknown default: break
+            }
+        }
         .onDisappear {
-            cam.stopRunning()
             countdownTimer?.invalidate(); countdownTimer = nil
             prompterTimer?.invalidate(); prompterTimer = nil
         }
@@ -98,14 +108,25 @@ struct ContentView: View {
             Color.black.ignoresSafeArea()
             CameraPreview(manager: cam)
                 .ignoresSafeArea()
+                // v3 (4): tap-only. The old DragGesture(minimumDistance: 0) sat on
+                // the full-screen preview and competed with every button and the
+                // preset ScrollView for touches.
                 .gesture(
-                    DragGesture(minimumDistance: 0).onEnded { v in
+                    SpatialTapGesture().onEnded { v in
                         if cam.trackingOn { cam.enableTapTracking(atLayerPoint: v.location) }
                         else { cam.focusAndExpose(atLayerPoint: v.location) }
                     }
                 )
 
-            overlays
+            // v3 (1): all high-frequency overlays live in leaf views now — their
+            // re-renders no longer touch this parent body or the preview.
+            TrackingOverlayView(cam: cam, showGrid: showGrid, showZebra: showZebra, showPeaking: showPeaking)
+            if showHistogram {
+                HistogramView(cam: cam)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    .padding(.top, 104).padding(.trailing, 12)
+                    .allowsHitTesting(false)
+            }
 
             VStack(spacing: 10) {
                 topBar
@@ -117,7 +138,7 @@ struct ContentView: View {
                         .foregroundStyle(.white)
                         .onTapGesture { cam.statusMessage = nil }
                 }
-                if coachOn { coachBar }
+                if coachOn { CoachBarView(cam: cam, showGolden: preset == .auto) }
                 Spacer()
                 if prompterOn { teleprompter }
                 if stopMotionOn, let img = onionImage {
@@ -126,6 +147,10 @@ struct ContentView: View {
                         .allowsHitTesting(false)
                 }
                 if proMode { proPanel }
+                // v3 (7): the level indicator is a compact row IN the control
+                // stack now — it used to float in the full-screen overlay at a
+                // fixed offset and ended up half-buried under the preset row.
+                if showLevel { LevelView(cam: cam) }
                 presetRow
                 shutterRow
             }
@@ -150,77 +175,20 @@ struct ContentView: View {
         .sheet(isPresented: $showHelp) { HelpView() }
     }
 
-    // MARK: Overlays
-    @ViewBuilder private var overlays: some View {
-        GeometryReader { geo in
-            ZStack {
-                if showGrid {
-                    GridOverlay().stroke(.white.opacity(0.35), lineWidth: 1)
-                }
-                if showZebra {
-                    // Simple highlight-warning indicator: red hatch in the brightest histogram zone is
-                    // represented as a labeled chip; full per-pixel zebra needs a Metal shader (v2).
-                    VStack { HStack { Label("Zebra ON — watch bright areas", systemImage: "stripe").font(.caption2.bold()).padding(6).background(.red.opacity(0.7), in: Capsule()); Spacer() }; Spacer() }
-                        .padding(.top, 64).padding(.leading, 10)
-                }
-                if showPeaking {
-                    RoundedRectangle(cornerRadius: 6).stroke(.green.opacity(0.55), lineWidth: 2)
-                        .overlay(alignment: .topTrailing) { Text("PEAKING ON").font(.caption2.bold()).padding(6) }
-                }
-                if let r = cam.trackedRect {
-                    let rect = CGRect(x: r.minX * geo.size.width, y: r.minY * geo.size.height, width: r.width * geo.size.width, height: r.height * geo.size.height)
-                    RoundedRectangle(cornerRadius: 8).stroke(.yellow, lineWidth: 3).frame(width: rect.width, height: rect.height)
-                        .position(x: rect.midX, y: rect.midY)
-                    Text("TRACKING").font(.caption2.bold()).foregroundStyle(.black)
-                        .padding(.horizontal, 6).padding(.vertical, 2).background(.yellow, in: Capsule())
-                        .position(x: rect.midX, y: max(rect.minY - 14, 10))
-                }
-                if let f = cam.focusReticle {
-                    RoundedRectangle(cornerRadius: 4).stroke(.white, lineWidth: 1.5).frame(width: 56, height: 56)
-                        .position(x: f.x * geo.size.width, y: f.y * geo.size.height)
-                }
-                if showLevel {
-                    let level = abs(cam.levelDegrees) < 1.5
-                    VStack {
-                        Spacer()
-                        ZStack {
-                            Capsule().fill(.white.opacity(0.25)).frame(width: 130, height: 4)
-                            Capsule().fill(level ? .green : .yellow).frame(width: 44, height: 4)
-                                .offset(x: CGFloat(max(min(cam.levelDegrees, 30), -30)) * 1.4)
-                        }
-                        Text(level ? "Level ✓" : String(format: "Tilt %.0f°", cam.levelDegrees)).font(.caption2)
-                        Spacer().frame(height: 190)
-                    }
-                }
-                if showHistogram {
-                    HStack(alignment: .bottom, spacing: 1) {
-                        ForEach(0..<16, id: \.self) { i in
-                            Rectangle().fill(.white.opacity(0.85)).frame(width: 7, height: CGFloat(cam.histogram[i]) * 900 + 2)
-                        }
-                    }
-                    .padding(6).background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
-                    .position(x: geo.size.width - 80, y: 110)
-                }
-            }
-        }
-        .allowsHitTesting(false)
-    }
-
     // MARK: Top bar
     private var topBar: some View {
         HStack(spacing: 12) {
             Label(cam.batteryPercent >= 0 ? "\(cam.batteryPercent)%" : "--%", systemImage: "battery.75")
                 .font(.subheadline.bold())
                 .padding(.horizontal, 10).padding(.vertical, 6).background(.black.opacity(0.55), in: Capsule())
+            // v3 (6): watchdog health pill — own leaf view, so its 1Hz updates
+            // re-render only the pill. Tap it while STALLED to restart the camera.
+            HealthPillView(cam: cam)
             if cam.trackingOn {
                 Label("TRACKING ON", systemImage: "scope").font(.caption.bold())
                     .padding(.horizontal, 8).padding(.vertical, 5).background(.yellow, in: Capsule()).foregroundStyle(.black)
             }
-            if cam.isRecording {
-                Label(String(format: "%02d:%02d", cam.recordingSeconds / 60, cam.recordingSeconds % 60), systemImage: "record.circle.fill")
-                    .font(.subheadline.bold()).foregroundStyle(.red)
-                    .padding(.horizontal, 10).padding(.vertical, 6).background(.black.opacity(0.55), in: Capsule())
-            }
+            RecordingPillView(cam: cam)
             Spacer()
             topButton(cam.isTorchOn ? "flashlight.on.fill" : "flashlight.off.fill") { cam.setTorch(!cam.isTorchOn) }
             topButton("arrow.triangle.2.circlepath.camera.fill") { cam.flipCamera() }
@@ -326,36 +294,6 @@ struct ContentView: View {
         }
     }
 
-    private var brightness: Double { cam.histogram.enumerated().reduce(0) { $0 + $1.element * Double($1.offset * 16 + 8) } / 255.0 }
-    private var coachTip: String {
-        if brightness > 0 && brightness < 0.22 { return "💡 Coach: Too dark — tap the torch (flashlight button) or use the Night preset." }
-        if cam.trackedRect != nil { return "💡 Coach: Face found — you're in focus. Shoot!" }
-        if abs(cam.levelDegrees) > 4 { return "💡 Coach: Level your shot — tilt the phone until the line turns green." }
-        if brightness > 0.85 { return "💡 Coach: Very bright — try EV −1 in PRO so highlights don't blow out." }
-        return "💡 Coach: Looks good — steady hands, shoot away."
-    }
-    private var coachBar: some View {
-        HStack(spacing: 8) {
-            Text(coachTip).font(.caption.bold())
-            Spacer()
-            if preset == .auto { Text(goldenBadge).font(.caption2.bold()).padding(.horizontal, 7).padding(.vertical, 4).background(Color.orange.opacity(0.85), in: Capsule()) }
-        }
-        .padding(.horizontal, 12).padding(.vertical, 7)
-        .background(.black.opacity(0.6), in: Capsule())
-    }
-    private var goldenBadge: String {
-        // Approx sunset from day-of-year + coarse latitude (solar math, no exact location needed)
-        let cal = Calendar.current
-        let n = Double(cal.ordinality(of: .day, in: .year, for: Date()) ?? 172)
-        let lat = (cam.latitude ?? 39.0) * Double.pi / 180
-        let decl = -23.44 * Double.pi / 180 * cos(2 * Double.pi / 365 * (n + 10))
-        let cosH = min(max((cos(90.833 * Double.pi / 180) - sin(lat) * sin(decl)) / (cos(lat) * cos(decl)), -1), 1)
-        let sunset = 12 + acos(cosH) * 180 / Double.pi / 15  // local solar time, approx
-        let golden = sunset - 1
-        let h = Int(golden), m = Int((golden - Double(h)) * 60)
-        let hour12 = h > 12 ? h - 12 : max(h, 1)
-        return "🌅 Golden hour ~\(hour12):\(String(format: "%02d", m)) PM (approx)"
-    }
     private var teleprompter: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 14).fill(.black.opacity(0.55)).frame(height: 190)
@@ -438,6 +376,15 @@ struct ContentView: View {
     private var toolsSheet: some View {
         NavigationStack {
             List {
+                Section {
+                    HStack {
+                        Text("Camera health")
+                        Spacer()
+                        HealthPillView(cam: cam)
+                    }
+                    Button("Restart Camera") { cam.manualRestartCamera() }
+                    Text("If the picture ever stalls, ApexCam restarts the camera by itself — the pill turns red (STALLED) first. You can also tap Restart Camera here, or tap the pill on the main screen while it's stalled.").font(.caption).foregroundStyle(.secondary)
+                } header: { Text("🩺 Camera Health — new in v3") }
                 Section("Easy wins") {
                     Toggle("Dual Save — backup copy in the app + Photos (like 2 memory cards)", isOn: $dualSave)
                         .onChange(of: dualSave) { _, v in cam.dualSave = v }
@@ -503,6 +450,151 @@ struct ContentView: View {
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showTools = false } } }
         }
         .presentationDetents([.large])
+    }
+}
+
+// MARK: - Leaf views (v3 (1))
+// Each of these is its own View struct with its own @ObservedObject cam, so a
+// publish of levelDegrees / histogram / trackedRect / healthText / recording
+// state re-renders ONLY that small subtree — never the parent camera screen
+// and never the UIViewRepresentable preview. The parent ContentView body reads
+// none of those high-frequency values (verified by grep).
+
+struct HealthPillView: View {
+    @ObservedObject var cam: CameraManager
+    private var color: Color {
+        if cam.healthText.contains("LIVE") { return .green }
+        if cam.healthText.contains("STALLED") { return .red }
+        return .yellow
+    }
+    var body: some View {
+        Button {
+            if cam.healthText.contains("STALLED") { cam.manualRestartCamera() }
+        } label: {
+            Text(cam.healthText)
+                .font(.caption.bold())
+                .foregroundStyle(color)
+                .padding(.horizontal, 8).padding(.vertical, 5)
+                .background(.black.opacity(0.55), in: Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct RecordingPillView: View {
+    @ObservedObject var cam: CameraManager
+    var body: some View {
+        if cam.isRecording {
+            Label(String(format: "%02d:%02d", cam.recordingSeconds / 60, cam.recordingSeconds % 60), systemImage: "record.circle.fill")
+                .font(.subheadline.bold()).foregroundStyle(.red)
+                .padding(.horizontal, 10).padding(.vertical, 6).background(.black.opacity(0.55), in: Capsule())
+        }
+    }
+}
+
+struct LevelView: View {
+    @ObservedObject var cam: CameraManager
+    var body: some View {
+        let level = abs(cam.levelDegrees) < 1.5
+        HStack(spacing: 8) {
+            Spacer()
+            ZStack {
+                Capsule().fill(.white.opacity(0.25)).frame(width: 110, height: 4)
+                Capsule().fill(level ? .green : .yellow).frame(width: 38, height: 4)
+                    .offset(x: CGFloat(max(min(cam.levelDegrees, 30), -30)) * 1.2)
+            }
+            Text(level ? "Level ✓" : String(format: "Tilt %.0f°", cam.levelDegrees))
+                .font(.caption2.bold())
+            Spacer()
+        }
+        .padding(.vertical, 3)
+        .allowsHitTesting(false)
+    }
+}
+
+struct HistogramView: View {
+    @ObservedObject var cam: CameraManager
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 1) {
+            ForEach(0..<16, id: \.self) { i in
+                Rectangle().fill(.white.opacity(0.85)).frame(width: 7, height: CGFloat(cam.histogram[i]) * 900 + 2)
+            }
+        }
+        .padding(6).background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+struct TrackingOverlayView: View {
+    @ObservedObject var cam: CameraManager
+    var showGrid: Bool
+    var showZebra: Bool
+    var showPeaking: Bool
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                if showGrid {
+                    GridOverlay().stroke(.white.opacity(0.35), lineWidth: 1)
+                }
+                if showZebra {
+                    // Simple highlight-warning indicator chip; full per-pixel zebra
+                    // needs a Metal shader (later). Honestly labeled in the UI.
+                    VStack { HStack { Label("Zebra ON — watch bright areas", systemImage: "stripe").font(.caption2.bold()).padding(6).background(.red.opacity(0.7), in: Capsule()); Spacer() }; Spacer() }
+                        .padding(.top, 64).padding(.leading, 10)
+                }
+                if showPeaking {
+                    RoundedRectangle(cornerRadius: 6).stroke(.green.opacity(0.55), lineWidth: 2)
+                        .overlay(alignment: .topTrailing) { Text("PEAKING ON").font(.caption2.bold()).padding(6) }
+                }
+                if let r = cam.trackedRect {
+                    let rect = CGRect(x: r.minX * geo.size.width, y: r.minY * geo.size.height, width: r.width * geo.size.width, height: r.height * geo.size.height)
+                    RoundedRectangle(cornerRadius: 8).stroke(.yellow, lineWidth: 3).frame(width: rect.width, height: rect.height)
+                        .position(x: rect.midX, y: rect.midY)
+                    Text("TRACKING").font(.caption2.bold()).foregroundStyle(.black)
+                        .padding(.horizontal, 6).padding(.vertical, 2).background(.yellow, in: Capsule())
+                        .position(x: rect.midX, y: max(rect.minY - 14, 10))
+                }
+                if let f = cam.focusReticle {
+                    RoundedRectangle(cornerRadius: 4).stroke(.white, lineWidth: 1.5).frame(width: 56, height: 56)
+                        .position(x: f.x * geo.size.width, y: f.y * geo.size.height)
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+struct CoachBarView: View {
+    @ObservedObject var cam: CameraManager
+    var showGolden: Bool
+    private var brightness: Double { cam.histogram.enumerated().reduce(0) { $0 + $1.element * Double($1.offset * 16 + 8) } / 255.0 }
+    private var coachTip: String {
+        if brightness > 0 && brightness < 0.22 { return "💡 Coach: Too dark — tap the torch (flashlight button) or use the Night preset." }
+        if cam.trackedRect != nil { return "💡 Coach: Face found — you're in focus. Shoot!" }
+        if abs(cam.levelDegrees) > 4 { return "💡 Coach: Level your shot — tilt the phone until the line turns green." }
+        if brightness > 0.85 { return "💡 Coach: Very bright — try EV −1 in PRO so highlights don't blow out." }
+        return "💡 Coach: Looks good — steady hands, shoot away."
+    }
+    private var goldenBadge: String {
+        // Approx sunset from day-of-year + coarse latitude (solar math, no exact location needed)
+        let cal = Calendar.current
+        let n = Double(cal.ordinality(of: .day, in: .year, for: Date()) ?? 172)
+        let lat = (cam.latitude ?? 39.0) * Double.pi / 180
+        let decl = -23.44 * Double.pi / 180 * cos(2 * Double.pi / 365 * (n + 10))
+        let cosH = min(max((cos(90.833 * Double.pi / 180) - sin(lat) * sin(decl)) / (cos(lat) * cos(decl)), -1), 1)
+        let sunset = 12 + acos(cosH) * 180 / Double.pi / 15  // local solar time, approx
+        let golden = sunset - 1
+        let h = Int(golden), m = Int((golden - Double(h)) * 60)
+        let hour12 = h > 12 ? h - 12 : max(h, 1)
+        return "🌅 Golden hour ~\(hour12):\(String(format: "%02d", m)) PM (approx)"
+    }
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(coachTip).font(.caption.bold())
+            Spacer()
+            if showGolden { Text(goldenBadge).font(.caption2.bold()).padding(.horizontal, 7).padding(.vertical, 4).background(Color.orange.opacity(0.85), in: Capsule()) }
+        }
+        .padding(.horizontal, 12).padding(.vertical, 7)
+        .background(.black.opacity(0.6), in: Capsule())
     }
 }
 
