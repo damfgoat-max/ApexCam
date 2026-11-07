@@ -351,7 +351,7 @@ final class CameraManager: NSObject, ObservableObject {
             sessionQueue.async {
                 try? device.lockForConfiguration()
                 if device.isExposureModeSupported(.custom) {
-                    device.setExposureModeCustom(duration: CMTime(value: 1, timescale: 1000), iso: AVCaptureISOCurrent, completionHandler: nil)
+                    device.setExposureModeCustom(duration: CMTime(value: 1, timescale: 1000), iso: device.iso, completionHandler: nil)
                 }
                 if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
                 device.unlockForConfiguration()
