@@ -29,9 +29,11 @@ struct ContentView: View {
     @State private var useRAW = false
     @State private var rainMode = false
     @State private var batterySaver = false
-    @State private var stabilization = "cinematicExtended"
+    @State private var stabilization = "auto"
     @State private var fps: Double = 30
     @State private var countdown = 0
+    @State private var countdownTimer: Timer? = nil
+    @State private var prompterTimer: Timer? = nil
 
     // Magic Tools
     @State private var motionAuto = false
@@ -60,8 +62,35 @@ struct ContentView: View {
                 cameraScreen
             }
         }
-        .onAppear { cam.requestAndConfigure(); cam.startRunning(); cam.dualSave = dualSave; cam.useRAW = useRAW }
-        .onDisappear { cam.stopRunning() }
+        .onAppear {
+            cam.dualSave = dualSave; cam.useRAW = useRAW
+            // v2 (a): start the camera ONLY after onboarding is finished, and let
+            // CameraManager's configure-once guard own starting the session.
+            if onboarded { cam.requestAndConfigure() }
+            cam.setSampleBufferToolsEnabled(showHistogram || motionAuto || smileAuto)
+            cam.setHistogramVisible(showHistogram)
+        }
+        .onChange(of: onboarded) { _, done in
+            if done { cam.requestAndConfigure() }
+        }
+        .onChange(of: showHistogram) { _, v in
+            cam.setHistogramVisible(v)
+            cam.setSampleBufferToolsEnabled(v || motionAuto || smileAuto)
+        }
+        .onChange(of: motionAuto) { _, v in cam.setSampleBufferToolsEnabled(showHistogram || v || smileAuto) }
+        .onChange(of: smileAuto) { _, v in cam.setSampleBufferToolsEnabled(showHistogram || motionAuto || v) }
+        .onChange(of: isVideoMode) { _, video in
+            // Entering video picks a 16:9 format; leaving it restores full photo quality.
+            if video { if preset != .video { cam.selectBestVideoFormat(fps: fps) } } else { cam.usePhotoMode() }
+        }
+        .onChange(of: prompterOn) { _, on in
+            if !on { prompterTimer?.invalidate(); prompterTimer = nil }
+        }
+        .onDisappear {
+            cam.stopRunning()
+            countdownTimer?.invalidate(); countdownTimer = nil
+            prompterTimer?.invalidate(); prompterTimer = nil
+        }
     }
 
     private var cameraScreen: some View {
@@ -217,7 +246,9 @@ struct ContentView: View {
                     Button {
                         preset = p
                         if p == .video || p == .vlog { isVideoMode = true }
+                        else if isVideoMode { isVideoMode = false }  // triggers usePhotoMode via onChange
                         cam.applyPreset(p)
+                        if p != .video && p != .vlog { cam.usePhotoMode() }
                     } label: {
                         VStack(spacing: 4) {
                             Image(systemName: p.icon).font(.system(size: 20 * big))
@@ -287,10 +318,11 @@ struct ContentView: View {
     }
 
     private func startCountdownThenShoot() {
+        countdownTimer?.invalidate()
         countdown = 3
-        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { t in
+        countdownTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { t in
             countdown -= 1
-            if countdown <= 0 { t.invalidate(); cam.capturePhoto() }
+            if countdown <= 0 { t.invalidate(); countdownTimer = nil; cam.capturePhoto() }
         }
     }
 
@@ -334,13 +366,15 @@ struct ContentView: View {
         }
         .frame(height: 190)
         .onAppear {
+            prompterTimer?.invalidate()  // v2 (e): never stack a second scrolling timer
             prompterOffset = 130
-            Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { t in
+            prompterTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { t in
                 if !prompterOn { t.invalidate(); return }
                 prompterOffset -= CGFloat(prompterSpeed) * 0.7
                 if prompterOffset < -320 { prompterOffset = 130 }
             }
         }
+        .onDisappear { prompterTimer?.invalidate(); prompterTimer = nil }
     }
 
     private func toggleTimelapse(_ on: Bool) {

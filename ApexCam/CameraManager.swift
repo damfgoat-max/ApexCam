@@ -58,6 +58,13 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var statusMessage: String? = nil
     @Published var lastSavedTick = 0               // bump to refresh gallery
     @Published var supportsRAW = false
+    @Published var needsSampleBuffer = false   // true while histogram/motion/smile tools need the data output
+    private var isConfiguring = false          // configure-once guard (a)
+    private var dataOutputAttached = false     // lazy data output state (c)
+    private var histogramVisible = false       // publish histogram only when its tool is on screen (b)
+    private var requestedVideoFPS: Double? = nil  // non-nil only while a video format is active (f)
+    private var lastPublishedLevel: Double = 0
+    private let motionQueue = OperationQueue()
     @Published var isTorchOn = false
     @Published var latitude: Double? = nil
 
@@ -159,9 +166,13 @@ final class CameraManager: NSObject, ObservableObject {
 
     // MARK: Permissions / setup
     func requestAndConfigure() {
+        // v2 (a): no-op if already configured or a configure is already in flight.
+        guard !isConfigured, !isConfiguring else { return }
+        isConfiguring = true
         AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
             guard let self else { return }
             if !granted {
+                self.isConfiguring = false
                 DispatchQueue.main.async { self.statusMessage = "Camera permission is off. Turn it on in Settings > ApexCam Pro > Camera, then reopen the app." }
                 return
             }
@@ -172,13 +183,17 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     private func configureSession() {
-        guard !isConfigured else { session.startRunning(); return }
+        // Runs on sessionQueue. Configures exactly once; starts the session exactly once.
+        guard !isConfigured else { if !session.isRunning { session.startRunning() }; return }
         session.beginConfiguration()
-        session.sessionPreset = .inputPriority
+        // v2 (f): photo preset at launch — AVFoundation picks its optimal high-quality
+        // format. No custom activeFormat is forced until the user shoots video / picks fps.
+        session.sessionPreset = .photo
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
                 ?? AVCaptureDevice.default(for: .video),
               let input = try? AVCaptureDeviceInput(device: device) else {
             session.commitConfiguration()
+            isConfiguring = false
             DispatchQueue.main.async { self.statusMessage = "No camera was found on this device." }
             return
         }
@@ -188,7 +203,9 @@ final class CameraManager: NSObject, ObservableObject {
         }
         if session.canAddOutput(photoOutput) {
             session.addOutput(photoOutput)
+            // v2 (h): best capture quality + largest photo dimensions the device offers.
             photoOutput.maxPhotoQualityPrioritization = .quality
+            updateMaxPhotoDimensions(for: device)
         }
         if session.canAddOutput(movieOutput) { session.addOutput(movieOutput) }
         if session.canAddOutput(metadataOutput) {
@@ -198,21 +215,58 @@ final class CameraManager: NSObject, ObservableObject {
                 metadataOutput.metadataObjectTypes = [.face]
             }
         }
+        // v2 (c): the video data output is NOT added here — it is attached lazily by
+        // setSampleBufferToolsEnabled when histogram / motion-auto / smile tools turn on.
         dataOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
         dataOutput.alwaysDiscardsLateVideoFrames = true
-        if session.canAddOutput(dataOutput) {
-            session.addOutput(dataOutput)
-            dataOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "apexcam.data"))
-        }
         session.commitConfiguration()
-        selectBestVideoFormat(fps: 30)
-        applyStabilization("cinematic")
+        // v2 (g): gentle stabilization on the MOVIE connection only; nothing cinematic
+        // is applied to the photo connection (that crops the sensor = softer/grainier).
+        applyStabilization("auto")
+        // v2 (h): explicitly put the device in full system-auto (focus/exposure/WB) at
+        // launch so no custom exposure state leaks into the first shot.
+        applyAutoOnSessionQueue()
         let rawOK = !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty
+        isConfiguring = false
         DispatchQueue.main.async {
             self.supportsRAW = rawOK
             self.isConfigured = true
         }
-        session.startRunning()
+        if !session.isRunning { session.startRunning() }
+    }
+
+    // Largest maxPhotoDimensions the active format supports (guarded).
+    private func updateMaxPhotoDimensions(for device: AVCaptureDevice) {
+        let dims = device.activeFormat.supportedMaxPhotoDimensions
+        if let largest = dims.max(by: { Int($0.width) * Int($0.height) < Int($1.width) * Int($1.height) }) {
+            photoOutput.maxPhotoDimensions = largest
+        }
+    }
+
+    // MARK: Lazy sample-buffer tools (c)
+    func setHistogramVisible(_ visible: Bool) { histogramVisible = visible }
+
+    func setSampleBufferToolsEnabled(_ enabled: Bool) {
+        if needsSampleBuffer != enabled {
+            DispatchQueue.main.async { self.needsSampleBuffer = enabled }
+        }
+        sessionQueue.async {
+            if enabled, !self.dataOutputAttached {
+                self.session.beginConfiguration()
+                if self.session.canAddOutput(self.dataOutput) {
+                    self.dataOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "apexcam.data"))
+                    self.session.addOutput(self.dataOutput)
+                    self.dataOutputAttached = true
+                }
+                self.session.commitConfiguration()
+            } else if !enabled, self.dataOutputAttached {
+                self.session.beginConfiguration()
+                self.session.removeOutput(self.dataOutput)
+                self.dataOutputAttached = false
+                self.lastAvgLuma = -1
+                self.session.commitConfiguration()
+            }
+        }
     }
 
     func startRunning() { sessionQueue.async { if !self.session.isRunning { self.session.startRunning() } } }
@@ -222,19 +276,27 @@ final class CameraManager: NSObject, ObservableObject {
     private func startLevel() {
         guard motion.isDeviceMotionAvailable else { return }
         motion.deviceMotionUpdateInterval = 0.15
-        motion.startDeviceMotionUpdates(to: .main) { [weak self] m, _ in
-            guard let m else { return }
+        motionQueue.name = "apexcam.motion"
+        motionQueue.maxConcurrentOperationCount = 1
+        motion.startDeviceMotionUpdates(to: motionQueue) { [weak self] m, _ in
+            guard let self, let m else { return }
             let roll = atan2(m.gravity.y, m.gravity.x) + Double.pi / 2
             var deg = roll * 180 / Double.pi
             if deg > 90 { deg -= 180 }; if deg < -90 { deg += 180 }
-            self?.levelDegrees = deg
+            let rounded = deg.rounded()
+            // v2 (b): only publish when the rounded value actually moved >= 1 degree,
+            // so the UI is not re-rendered several times a second forever.
+            guard abs(rounded - self.lastPublishedLevel) >= 1 else { return }
+            self.lastPublishedLevel = rounded
+            DispatchQueue.main.async { self.levelDegrees = rounded }
         }
     }
 
     // MARK: Volume-button shutter (best effort)
     private func observeVolume() {
+        // v2 (d): do NOT setActive(true) here — activating our own audio session at
+        // launch can fight the capture session. KVO on outputVolume works without it.
         let audio = AVAudioSession.sharedInstance()
-        try? audio.setActive(true)
         var last = audio.outputVolume
         volumeObservation = audio.observe(\.outputVolume, options: [.new]) { [weak self] _, change in
             guard let self, let v = change.newValue, v != last else { return }
@@ -256,8 +318,11 @@ final class CameraManager: NSObject, ObservableObject {
             if let old = self.videoInput { self.session.removeInput(old) }
             if self.session.canAddInput(input) { self.session.addInput(input); self.videoInput = input; self.currentDevice = device }
             self.session.commitConfiguration()
+            self.updateMaxPhotoDimensions(for: device)
             DispatchQueue.main.async { self.isFront = (target == .front); self.trackedRect = nil; self.trackingOn = false }
-            self.selectBestVideoFormat(fps: 30)
+            // Photo mode keeps the system format after a flip; only re-apply a custom
+            // format if the user is actually in a video/fps selection right now.
+            if let fps = self.requestedVideoFPS { self.selectBestVideoFormat(fps: fps) }
         }
     }
 
@@ -311,14 +376,18 @@ final class CameraManager: NSObject, ObservableObject {
 
     // MARK: Manual / Auto controls
     func applyAuto() {
+        sessionQueue.async { self.applyAutoOnSessionQueue() }
+    }
+
+    // Must be called on sessionQueue (or during configure). Full system-auto: the
+    // phone's best focus/exposure/white-balance; Auto never hand-raises ISO (i).
+    private func applyAutoOnSessionQueue() {
         guard let device = currentDevice else { return }
-        sessionQueue.async {
-            try? device.lockForConfiguration()
-            if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
-            if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
-            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
-            device.unlockForConfiguration()
-        }
+        try? device.lockForConfiguration()
+        if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
+        if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+        if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
+        device.unlockForConfiguration()
     }
 
     func applyManual(iso: Float, shutterDenominator: Float, wbKelvin: Float, evBias: Float, focusPosition: Float) {
@@ -387,32 +456,64 @@ final class CameraManager: NSObject, ObservableObject {
 
     // MARK: Video format / stabilization
     func selectBestVideoFormat(fps: Double) {
+        requestedVideoFPS = fps
         guard let device = currentDevice else { return }
         sessionQueue.async {
-            var best: AVCaptureDevice.Format? = nil
-            var bestWidth: Int32 = 0
-            for format in device.formats {
-                let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-                guard dims.width <= 3840 else { continue }
-                let supports = format.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= fps && $0.minFrameRate <= fps }
-                if supports && dims.width > bestWidth { best = format; bestWidth = dims.width }
+            // Score formats: 3840x2160 first, then 1920x1080, then any other 16:9,
+            // then anything else by width. 4:3 full-sensor formats are avoided — the
+            // full-screen portrait preview would crop them heavily (= soft/grainy).
+            func score(_ format: AVCaptureDevice.Format) -> (Int, Int32) {
+                let d = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+                let stab = format.isVideoStabilizationSupported ? 1 : 0  // tiebreak: cinematic-capable
+                if d.width == 3840 && d.height == 2160 { return (400 + stab, d.width) }
+                if d.width == 1920 && d.height == 1080 { return (300 + stab, d.width) }
+                if d.height > 0, abs(Double(d.width) / Double(d.height) - 16.0 / 9.0) < 0.01 { return (200 + stab, d.width) }
+                return (stab, d.width)
             }
-            // Slow-mo fallback: if fps > 60 no 4K format matches, take any format that supports it
-            if best == nil && fps > 60 {
-                for format in device.formats {
-                    let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-                    if format.videoSupportedFrameRateRanges.contains(where: { $0.maxFrameRate >= fps }) && dims.width > bestWidth {
-                        best = format; bestWidth = dims.width
-                    }
-                }
+            let supportsFPS = { (format: AVCaptureDevice.Format) in
+                format.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= fps && $0.minFrameRate <= fps }
             }
-            guard let format = best else { return }
+            var candidates = device.formats.filter(supportsFPS)
+            if candidates.isEmpty && fps > 60 {
+                // Slow-mo fallback: any format that can reach the requested rate.
+                candidates = device.formats.filter { f in f.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= fps } }
+            }
+            guard let format = candidates.max(by: { score($0) < score($1) }) else { return }
+            self.session.beginConfiguration()
+            self.session.sessionPreset = .inputPriority  // required to set a custom activeFormat
             try? device.lockForConfiguration()
             device.activeFormat = format
-            let duration = CMTime(value: 1, timescale: CMTimeScale(fps))
-            device.activeVideoMinFrameDuration = duration
-            device.activeVideoMaxFrameDuration = duration
+            if fps == 24 || fps == 30 {
+                // v2 (f): don't lock frame duration at normal rates — locking fights
+                // the phone's low-light exposure and adds noise/grain.
+                device.activeVideoMinFrameDuration = .invalid
+                device.activeVideoMaxFrameDuration = .invalid
+            } else {
+                let duration = CMTime(value: 1, timescale: CMTimeScale(fps))
+                device.activeVideoMinFrameDuration = duration
+                device.activeVideoMaxFrameDuration = duration
+            }
             device.unlockForConfiguration()
+            self.session.commitConfiguration()
+        }
+    }
+
+    // Back to still-photo shooting: restore the .photo preset and clear any
+    // frame-rate locks so the preview/capture return to full system quality (f).
+    func usePhotoMode() {
+        requestedVideoFPS = nil
+        sessionQueue.async {
+            self.session.beginConfiguration()
+            self.session.sessionPreset = .photo
+            if let device = self.currentDevice {
+                try? device.lockForConfiguration()
+                device.activeVideoMinFrameDuration = .invalid
+                device.activeVideoMaxFrameDuration = .invalid
+                device.unlockForConfiguration()
+                self.updateMaxPhotoDimensions(for: device)
+            }
+            self.session.commitConfiguration()
+            self.applyAutoOnSessionQueue()
         }
     }
 
@@ -427,9 +528,8 @@ final class CameraManager: NSObject, ObservableObject {
         default: m = .cinematic
         }
         conn.preferredVideoStabilizationMode = m
-        if let pc = photoOutput.connection(with: .video), pc.isVideoStabilizationSupported {
-            pc.preferredVideoStabilizationMode = m == .cinematicExtended ? .cinematic : m
-        }
+        // v2 (g): the PHOTO connection is deliberately left alone — stabilizing it
+        // crops the sensor and makes preview/photos softer and grainier.
     }
 
     private func applyBatterySaver() {
@@ -453,6 +553,7 @@ final class CameraManager: NSObject, ObservableObject {
                 }
             }
             guard let s = settings else { return }
+            s.photoQualityPrioritization = .quality  // v2 (h)
             s.flashMode = (self.currentDevice?.hasFlash == true) ? .auto : .off
             if let conn = self.photoOutput.connection(with: .video), conn.isVideoOrientationSupported {
                 conn.videoOrientation = .portrait
@@ -619,8 +720,11 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
             capturePhoto()
         }
         lastAvgLuma = avg
-        let normalized = bins.map { $0 / count }
-        DispatchQueue.main.async { self.histogram = normalized }
+        // v2 (b): publish the histogram only when its tool is actually on screen.
+        if histogramVisible {
+            let normalized = bins.map { $0 / count }
+            DispatchQueue.main.async { self.histogram = normalized }
+        }
     }
 }
 
