@@ -267,8 +267,8 @@ struct EditStudioView: View {
         case "Vivid": img = ci("CIPhotoEffectProcess", img)
         case "Mono": img = ci("CIPhotoEffectMono", img)
         case "Noir": img = ci("CIPhotoEffectNoir", img)
-        case "Warm": img = ci("CITemperatureAndTint", img, [kCIInputNeutralKey: CIVector(x: 6500, y: 0), kCIInputTargetNeutralKey: CIVector(x: 4200, y: 0)])
-        case "Cool": img = ci("CITemperatureAndTint", img, [kCIInputNeutralKey: CIVector(x: 6500, y: 0), kCIInputTargetNeutralKey: CIVector(x: 8500, y: 0)])
+        case "Warm": img = ci("CITemperatureAndTint", img, ["inputNeutral": CIVector(x: 6500, y: 0), "inputTargetNeutral": CIVector(x: 4200, y: 0)])
+        case "Cool": img = ci("CITemperatureAndTint", img, ["inputNeutral": CIVector(x: 6500, y: 0), "inputTargetNeutral": CIVector(x: 8500, y: 0)])
         case "Cinematic":
             img = ci("CIPhotoEffectFade", img)
             img = ci("CIVignette", img, [kCIInputIntensityKey: 0.7, kCIInputRadiusKey: 1.6])
