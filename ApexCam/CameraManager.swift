@@ -7,10 +7,11 @@ import CoreLocation
 import ImageIO
 
 enum CameraPreset: String, CaseIterable, Identifiable {
-    case auto = "Auto", sports = "Sports", portrait = "Portrait", night = "Night", vlog = "Vlog", macro = "Macro", video = "Video"
+    case allDay = "All-Day", auto = "Auto", sports = "Sports", portrait = "Portrait", night = "Night", vlog = "Vlog", macro = "Macro", video = "Video"
     var id: String { rawValue }
     var icon: String {
         switch self {
+        case .allDay: return "sun.max.fill"
         case .auto: return "wand.and.stars"
         case .sports: return "figure.run"
         case .portrait: return "person.crop.circle"
@@ -22,8 +23,9 @@ enum CameraPreset: String, CaseIterable, Identifiable {
     }
     var blurb: String {
         switch self {
+        case .allDay: return "THE default. Fast 1/1600 shutter for sports, auto everything else, and your LUT look baked into every photo. All day, no settings."
         case .auto: return "Everything automatic. Just point and shoot."
-        case .sports: return "Fast shutter to freeze motion. Great for wrestling & action."
+        case .sports: return "Fast shutter (1/1600) to freeze motion. Great for wrestling & action."
         case .portrait: return "Focus locks on faces and eyes."
         case .night: return "Slower shutter + higher ISO for dark scenes."
         case .vlog: return "Front camera, mirrored, smooth video."
@@ -97,6 +99,172 @@ final class CameraManager: NSObject, ObservableObject {
     var dualSave = true
     var batterySaver = false { didSet { applyBatterySaver() } }
     var useRAW = false
+
+    // MARK: LUT state (v4) — the photo version of Blackmagic's LUT workflow.
+    // Published values change ONLY on user action (pick a look, move the
+    // strength slider, toggle) or a finished import — never per frame. The one
+    // exception is gradedPreviewImage, read ONLY by GradedPreviewView (leaf).
+    @Published var lutAvailableNames: [String] = LUTEngine.builtInNames
+    @Published var lutSelectedName: String = "Warm Golden Hour"
+    @Published var lutStrength: Double = 1.0
+    @Published var lutApplyEnabled = true      // bake the LUT into saved photos (default ON)
+    @Published var lutPreviewEnabled = true    // live graded preview
+    @Published var gradedPreviewImage: UIImage? = nil
+    private var lutStore: [String: CubeLUT] = [:]
+    private let lutQueue = DispatchQueue(label: "apexcam.lut")
+    private let lutCIContext = CIContext(options: [.cacheIntermediates: false])
+    private let previewCIContext = CIContext()
+    private let cubeLock = NSLock()
+    private var activeCubeData: Data? = nil    // strength already blended in
+    private var activeCubeDimension: Int = 32
+    private var uiSampleTools = false          // histogram/motion/smile requested by UI
+    private var lutPreviewSuspended = false    // true while video mode is on screen
+    private var lastGradedPreviewTime = Date.distantPast
+    private var gradedImageWasCleared = true
+
+    static func importedLUTURL() -> URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let d = docs.appendingPathComponent("ImportedLUTs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }
+
+    private var lutPreviewWanted: Bool { lutPreviewEnabled && !lutPreviewSuspended && lutSelectedName != "None" }
+
+    private func loadLUTState() {
+        let ud = UserDefaults.standard
+        if let saved = ud.string(forKey: "apexLUTName") { lutSelectedName = saved }
+        if ud.object(forKey: "apexLUTStrength") != nil { lutStrength = ud.double(forKey: "apexLUTStrength") }
+        if ud.object(forKey: "apexLUTApply") != nil { lutApplyEnabled = ud.bool(forKey: "apexLUTApply") }
+        if ud.object(forKey: "apexLUTPreview") != nil { lutPreviewEnabled = ud.bool(forKey: "apexLUTPreview") }
+        // The default look is generated synchronously (32^3 nodes of simple
+        // math, one time) so the very first photo is already graded.
+        if let warm = LUTEngine.builtIn("Warm Golden Hour") { lutStore[warm.name] = warm }
+        lutQueue.async {
+            for name in LUTEngine.builtInNames where name != "None" && name != "Warm Golden Hour" {
+                if let lut = LUTEngine.builtIn(name) { self.lutStore[lut.name] = lut }
+            }
+            // Imported .cube files persisted from earlier sessions.
+            let dir = CameraManager.importedLUTURL()
+            if let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+                for url in files where url.pathExtension.lowercased() == "cube" {
+                    if let data = try? Data(contentsOf: url),
+                       let lut = LUTEngine.parseCube(data: data, fallbackName: url.deletingPathExtension().lastPathComponent) {
+                        self.lutStore[lut.name] = lut
+                    }
+                }
+            }
+            let names = LUTEngine.builtInNames + self.lutStore.keys.filter { !LUTEngine.builtInNames.contains($0) }.sorted()
+            DispatchQueue.main.async {
+                self.lutAvailableNames = names
+                if !names.contains(self.lutSelectedName) { self.lutSelectedName = "Warm Golden Hour" }
+                self.rebuildActiveCube()
+                self.refreshSampleAttachment()
+            }
+        }
+        rebuildActiveCube()
+    }
+
+    /// Rebuilds the active CIColorCube data (strength blended in) on lutQueue.
+    private func rebuildActiveCube() {
+        let name = lutSelectedName, strength = lutStrength
+        lutQueue.async {
+            let data = self.lutStore[name]?.cubeData(strength: strength)
+            self.cubeLock.lock()
+            self.activeCubeData = data
+            self.activeCubeDimension = self.lutStore[name]?.dimension ?? 32
+            self.cubeLock.unlock()
+        }
+    }
+
+    private func activeCubeSnapshot() -> (Data, Int)? {
+        cubeLock.lock(); defer { cubeLock.unlock() }
+        guard let d = activeCubeData else { return nil }
+        return (d, activeCubeDimension)
+    }
+
+    func selectLUT(_ name: String) {
+        lutSelectedName = name
+        UserDefaults.standard.set(name, forKey: "apexLUTName")
+        rebuildActiveCube()
+        refreshSampleAttachment()
+        if name == "None" { clearGradedPreview() }
+        statusMessage = name == "None" ? "LUT off — photos save ungraded." : "LUT: \(name) — baked into your photos."
+    }
+
+    func setLUTStrength(_ v: Double) {
+        lutStrength = min(max(v, 0), 1)
+        UserDefaults.standard.set(lutStrength, forKey: "apexLUTStrength")
+        rebuildActiveCube()
+    }
+
+    func setLUTApply(_ on: Bool) {
+        lutApplyEnabled = on
+        UserDefaults.standard.set(on, forKey: "apexLUTApply")
+    }
+
+    func setLUTPreview(_ on: Bool) {
+        lutPreviewEnabled = on
+        UserDefaults.standard.set(on, forKey: "apexLUTPreview")
+        refreshSampleAttachment()
+        if !on { clearGradedPreview() }
+    }
+
+    func setLUTPreviewSuspended(_ suspended: Bool) {
+        lutPreviewSuspended = suspended
+        refreshSampleAttachment()
+        if suspended { clearGradedPreview() }
+    }
+
+    private func clearGradedPreview() {
+        gradedImageWasCleared = true
+        DispatchQueue.main.async { self.gradedPreviewImage = nil }
+    }
+
+    /// Imports a .cube LUT picked in Files: copies it into Documents/
+    /// ImportedLUTs (so it persists), parses it on lutQueue, adds it to the
+    /// picker and selects it.
+    func importLUT(from url: URL) {
+        let scoped = url.startAccessingSecurityScopedResource()
+        let raw = try? Data(contentsOf: url)
+        if scoped { url.stopAccessingSecurityScopedResource() }
+        guard let raw else {
+            DispatchQueue.main.async { self.statusMessage = "Couldn't read that LUT file." }
+            return
+        }
+        let fallback = url.deletingPathExtension().lastPathComponent
+        lutQueue.async {
+            guard let lut = LUTEngine.parseCube(data: raw, fallbackName: fallback) else {
+                DispatchQueue.main.async { self.statusMessage = "That file isn't a valid .cube LUT (needs LUT_3D_SIZE 17/32/33/64)." }
+                return
+            }
+            let dest = CameraManager.importedLUTURL().appendingPathComponent("\(lut.name).cube")
+            try? raw.write(to: dest)
+            self.lutStore[lut.name] = lut
+            let names = LUTEngine.builtInNames + self.lutStore.keys.filter { !LUTEngine.builtInNames.contains($0) }.sorted()
+            DispatchQueue.main.async {
+                self.lutAvailableNames = names
+                self.selectLUT(lut.name)
+                self.statusMessage = "LUT imported: \(lut.name) ✓"
+            }
+        }
+    }
+
+    /// Renders one low-res graded frame for the live preview. Called only from
+    /// the sample-buffer delegate (data queue), throttled to ~10fps by the
+    /// caller. If no cube is ready yet it publishes nothing.
+    func renderGradedPreview(from pixelBuffer: CVPixelBuffer) {
+        guard let cube = activeCubeSnapshot() else { return }
+        let ci = CIImage(cvPixelBuffer: pixelBuffer)
+        guard ci.extent.width > 0 else { return }
+        let scale = min(1, 420 / ci.extent.width)
+        let small = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let graded = LUTEngine.colorCube(small, cubeData: cube.0, dimension: cube.1)
+        guard let cg = previewCIContext.createCGImage(graded, from: graded.extent) else { return }
+        gradedImageWasCleared = false
+        let img = UIImage(cgImage: cg)
+        DispatchQueue.main.async { self.gradedPreviewImage = img }
+    }
     private var recordTimer: Timer?
     private var lastHistogramTime = Date.distantPast
     private let motion = CMMotionManager()
@@ -119,6 +287,7 @@ final class CameraManager: NSObject, ObservableObject {
         }
         startLevel()
         observeVolume()
+        loadLUTState()
         locationManager.delegate = self
         locationManager.desiredAccuracy = kCLLocationAccuracyKilometer
         // v3: session health observers — a runtime error or a finished interruption
@@ -267,6 +436,10 @@ final class CameraManager: NSObject, ObservableObject {
         // v3 (8): center AF/AE + smooth AF + subject-area monitoring, so the first
         // frame isn't the dark/defocused one from the user's screenshot.
         applyCenterFocusExposureOnSessionQueue()
+        // v4: the default launch mode is All-Day Sports (fast-shutter priority,
+        // auto ISO/focus, −0.3 bias) — applied here, on sessionQueue, as part of
+        // the one-time configure so the very first shot already uses it.
+        applyAllDaySportsOnSessionQueue()
         let rawOK = !photoOutput.availableRawPhotoPixelFormatTypes.isEmpty
         isConfiguring = false
         DispatchQueue.main.async {
@@ -309,6 +482,16 @@ final class CameraManager: NSObject, ObservableObject {
     func setHistogramVisible(_ visible: Bool) { histogramVisible = visible }
 
     func setSampleBufferToolsEnabled(_ enabled: Bool) {
+        uiSampleTools = enabled
+        refreshSampleAttachment()
+    }
+
+    /// v4: the data output now serves two masters — the v3 tools (histogram /
+    /// motion / smile, requested via uiSampleTools) and the live LUT preview.
+    /// Attachment is still lazy and still all on sessionQueue; it detaches only
+    /// when NEITHER needs it.
+    func refreshSampleAttachment() {
+        let enabled = uiSampleTools || lutPreviewWanted
         if needsSampleBuffer != enabled {
             DispatchQueue.main.async { self.needsSampleBuffer = enabled }
         }
@@ -318,6 +501,11 @@ final class CameraManager: NSObject, ObservableObject {
                 if self.session.canAddOutput(self.dataOutput) {
                     self.dataOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "apexcam.data"))
                     self.session.addOutput(self.dataOutput)
+                    // Portrait buffers, so the graded preview image is upright
+                    // (luma tools don't care about orientation).
+                    if let conn = self.dataOutput.connection(with: .video), conn.isVideoOrientationSupported {
+                        conn.videoOrientation = .portrait
+                    }
                     self.dataOutputAttached = true
                 }
                 self.session.commitConfiguration()
@@ -564,21 +752,38 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    // Must be called on sessionQueue. All-Day / Sports exposure: shutter locked
+    // at 1/1600 (fast enough to freeze a takedown), continuous AF, exposure
+    // bias −0.3 where the mode supports it. AVFoundation has no true
+    // shutter-priority auto-ISO, so custom exposure starts from the device's
+    // current (auto-chosen) ISO and the shutter does the freezing.
+    private func applyAllDaySportsOnSessionQueue() {
+        guard let device = currentDevice else { return }
+        try? device.lockForConfiguration()
+        if device.isExposureModeSupported(.custom) {
+            device.setExposureModeCustom(duration: CMTime(value: 1, timescale: 1600), iso: device.iso, completionHandler: nil)
+        }
+        if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
+        device.setExposureTargetBias(-0.3, completionHandler: nil)
+        device.unlockForConfiguration()
+    }
+
+    /// The preset the UI last asked for. usePhotoMode() re-applies its exposure
+    /// at the end of its own session-queue block, so a video→photo restore can
+    /// never silently wipe the All-Day/Sports shutter (call-order proof).
+    private(set) var activePreset: CameraPreset = .allDay
+
     func applyPreset(_ preset: CameraPreset) {
+        activePreset = preset
         switch preset {
+        case .allDay:
+            sessionQueue.async { self.applyAllDaySportsOnSessionQueue() }
+            DispatchQueue.main.async { self.statusMessage = "All-Day Sports: 1/1600 shutter, auto everything else, LUT baked in." }
         case .auto: applyAuto()
         case .sports:
-            // Fast shutter 1/1000, auto ISO/WB — freeze motion
-            guard let device = currentDevice else { return }
-            sessionQueue.async {
-                try? device.lockForConfiguration()
-                if device.isExposureModeSupported(.custom) {
-                    device.setExposureModeCustom(duration: CMTime(value: 1, timescale: 1000), iso: device.iso, completionHandler: nil)
-                }
-                if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
-                device.unlockForConfiguration()
-            }
-            DispatchQueue.main.async { self.statusMessage = "Sports: fast shutter (1/1000) to freeze motion." }
+            // Fast shutter 1/1600 — freeze motion (same recipe as All-Day)
+            sessionQueue.async { self.applyAllDaySportsOnSessionQueue() }
+            DispatchQueue.main.async { self.statusMessage = "Sports: fast shutter (1/1600) to freeze motion." }
         case .portrait: applyAuto(); DispatchQueue.main.async { self.trackingOn = true }
         case .night:
             guard let device = currentDevice else { return }
@@ -667,6 +872,12 @@ final class CameraManager: NSObject, ObservableObject {
             }
             self.session.commitConfiguration()
             self.applyAutoOnSessionQueue()
+            // v4: if the active preset is All-Day/Sports, its fast-shutter
+            // exposure goes back on AFTER the Auto reset, in the same block —
+            // so leaving video mode lands on the preset, not plain Auto.
+            if self.activePreset == .allDay || self.activePreset == .sports {
+                self.applyAllDaySportsOnSessionQueue()
+            }
         }
     }
 
@@ -734,6 +945,20 @@ final class CameraManager: NSObject, ObservableObject {
 
     // MARK: Saving (Photos + optional Vault dual-save)
     fileprivate func savePhotoData(_ dataIn: Data, isRAW: Bool) {
+        // v4: bake the selected LUT into the photo before anything else touches
+        // it (like Blackmagic's Record LUT to Clip). Grading runs on lutQueue —
+        // never the main thread, never a view body. RAW files are never graded.
+        if !isRAW, lutApplyEnabled, let cube = activeCubeSnapshot() {
+            lutQueue.async {
+                let graded = LUTEngine.gradePhotoData(dataIn, cubeData: cube.0, dimension: cube.1, context: self.lutCIContext)
+                self.finishSavePhoto(graded ?? dataIn, isRAW: false)
+            }
+        } else {
+            finishSavePhoto(dataIn, isRAW: isRAW)
+        }
+    }
+
+    private func finishSavePhoto(_ dataIn: Data, isRAW: Bool) {
         let data = isRAW ? dataIn : embedGPS(into: dataIn)
         let ext = isRAW ? "dng" : "jpg"
         let name = "ApexCam-\(Int(Date().timeIntervalSince1970)).\(ext)"
@@ -882,6 +1107,17 @@ extension CameraManager: AVCaptureMetadataOutputObjectsDelegate {
 
 extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        // v4: live graded preview, ~10fps, rendered HERE on the data queue at
+        // low resolution — never on the main thread, never in a view body. The
+        // result is published to gradedPreviewImage, read only by the
+        // GradedPreviewView leaf. Gated off while recording / in video mode.
+        if lutPreviewWanted, !isRecording, let buf = CMSampleBufferGetImageBuffer(sampleBuffer) {
+            let pnow = Date()
+            if pnow.timeIntervalSince(lastGradedPreviewTime) > 0.1 {
+                lastGradedPreviewTime = pnow
+                renderGradedPreview(from: buf)
+            }
+        }
         let now = Date()
         guard now.timeIntervalSince(lastHistogramTime) > (batterySaver ? 0.6 : 0.25) else { return }
         lastHistogramTime = now

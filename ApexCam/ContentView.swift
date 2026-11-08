@@ -1,11 +1,13 @@
 import SwiftUI
 import AVFoundation
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var cam = CameraManager()
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("apexOnboarded") private var onboarded = false
-    @State private var preset: CameraPreset = .auto
+    @State private var preset: CameraPreset = .allDay
+    @State private var lutPreviewOn = true   // v4: mirrors cam's persisted preview toggle at launch
     @State private var proMode = false
     @State private var isVideoMode = false
     @State private var showTools = false
@@ -65,6 +67,7 @@ struct ContentView: View {
         }
         .onAppear {
             cam.dualSave = dualSave; cam.useRAW = useRAW
+            lutPreviewOn = cam.lutPreviewEnabled   // v4: restore persisted preview toggle
             // v2 (a): start the camera ONLY after onboarding is finished, and let
             // CameraManager's configure-once guard own starting the session.
             if onboarded { cam.requestAndConfigure() }
@@ -83,6 +86,8 @@ struct ContentView: View {
         .onChange(of: isVideoMode) { _, video in
             // Entering video picks a 16:9 format; leaving it restores full photo quality.
             if video { if preset != .video { cam.selectBestVideoFormat(fps: fps) } } else { cam.usePhotoMode() }
+            // v4: LUTs are a PHOTOS feature — suspend the graded preview in video.
+            cam.setLUTPreviewSuspended(video)
         }
         .onChange(of: prompterOn) { _, on in
             if !on { prompterTimer?.invalidate(); prompterTimer = nil }
@@ -118,6 +123,15 @@ struct ContentView: View {
                     }
                 )
 
+            // v4: live graded LUT preview — its own leaf view reading only
+            // cam.gradedPreviewImage (~10fps). Inserted under the overlays and
+            // controls; hit-testing off, so taps still reach the preview below.
+            if lutPreviewOn && !isVideoMode {
+                GradedPreviewView(cam: cam)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+            }
+
             // v3 (1): all high-frequency overlays live in leaf views now — their
             // re-renders no longer touch this parent body or the preview.
             TrackingOverlayView(cam: cam, showGrid: showGrid, showZebra: showZebra, showPeaking: showPeaking)
@@ -151,6 +165,9 @@ struct ContentView: View {
                 // stack now — it used to float in the full-screen overlay at a
                 // fixed offset and ended up half-buried under the preset row.
                 if showLevel { LevelView(cam: cam) }
+                // v4: the LUT bar — pick a look, import .cube files, strength.
+                // A leaf view: it reads cam's LUT state so the parent body doesn't.
+                if !isVideoMode { LUTBarView(cam: cam) }
                 presetRow
                 shutterRow
             }
@@ -212,11 +229,17 @@ struct ContentView: View {
             HStack(spacing: 10) {
                 ForEach(CameraPreset.allCases) { p in
                     Button {
+                        let wasVideo = isVideoMode
                         preset = p
                         if p == .video || p == .vlog { isVideoMode = true }
                         else if isVideoMode { isVideoMode = false }  // triggers usePhotoMode via onChange
                         cam.applyPreset(p)
-                        if p != .video && p != .vlog { cam.usePhotoMode() }
+                        // v4: only restore photo mode when actually leaving video —
+                        // calling usePhotoMode() unconditionally re-applied full
+                        // Auto AFTER the preset and wiped the preset's exposure
+                        // (it silently broke Sports in v3, and would break the
+                        // All-Day default the same way).
+                        if p != .video && p != .vlog && wasVideo { cam.usePhotoMode() }
                     } label: {
                         VStack(spacing: 4) {
                             Image(systemName: p.icon).font(.system(size: 20 * big))
@@ -419,6 +442,9 @@ struct ContentView: View {
                     HStack { Text("Scroll speed").font(.caption); Slider(value: $prompterSpeed, in: 0.3...3) }
                     Text("Tip: use the Vlog preset (front camera), turn this on, and read while you record.").font(.caption).foregroundStyle(.secondary)
                 } header: { Text("📜 Vlog Teleprompter") }
+                Section {
+                    LUTToolsSection(cam: cam) { on in lutPreviewOn = on }
+                } header: { Text("🎨 LUT Looks — Photos (new in v4)") }
                 Section("Look of the shot") {
                     Toggle("Grid (rule of thirds)", isOn: $showGrid)
                     Toggle("Level (keep it straight)", isOn: $showLevel)
@@ -459,6 +485,121 @@ struct ContentView: View {
 // state re-renders ONLY that small subtree — never the parent camera screen
 // and never the UIViewRepresentable preview. The parent ContentView body reads
 // none of those high-frequency values (verified by grep).
+
+// MARK: - LUT leaf views (v4)
+// GradedPreviewView is the ONLY view that reads cam.gradedPreviewImage (the
+// ~10fps graded frame). LUTBarView owns the LUT picker/import/strength UI and
+// reads cam's LUT state, which changes only on user action. Neither touches
+// the parent ContentView body.
+
+struct GradedPreviewView: View {
+    @ObservedObject var cam: CameraManager
+    var body: some View {
+        GeometryReader { geo in
+            if let img = cam.gradedPreviewImage {
+                Image(uiImage: img)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .clipped()
+                    .overlay(alignment: .topLeading) {
+                        Text("LUT PREVIEW")
+                            .font(.caption2.bold())
+                            .padding(.horizontal, 6).padding(.vertical, 3)
+                            .background(.black.opacity(0.55), in: Capsule())
+                            .padding(.top, 54).padding(.leading, 10)
+                    }
+            }
+        }
+    }
+}
+
+struct LUTBarView: View {
+    @ObservedObject var cam: CameraManager
+    @State private var showImporter = false
+    @State private var draftStrength: Double? = nil   // non-nil while the slider is being dragged
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                Button { expanded.toggle() } label: {
+                    Label("LUT", systemImage: "camera.filters")
+                        .font(.caption.bold())
+                        .padding(.horizontal, 9).padding(.vertical, 7)
+                        .background(Color.orange, in: Capsule())
+                        .foregroundStyle(.black)
+                }.buttonStyle(.plain)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 7) {
+                        ForEach(cam.lutAvailableNames, id: \.self) { name in
+                            Button { cam.selectLUT(name) } label: {
+                                Text(name)
+                                    .font(.caption.bold())
+                                    .padding(.horizontal, 10).padding(.vertical, 7)
+                                    .background(cam.lutSelectedName == name ? Color.orange : Color.black.opacity(0.55), in: Capsule())
+                                    .foregroundStyle(cam.lutSelectedName == name ? .black : .white)
+                            }.buttonStyle(.plain)
+                        }
+                    }
+                }
+                Button { showImporter = true } label: {
+                    Label("Import", systemImage: "square.and.arrow.down")
+                        .font(.caption.bold())
+                        .padding(.horizontal, 9).padding(.vertical, 7)
+                        .background(.black.opacity(0.55), in: Capsule())
+                }.buttonStyle(.plain)
+            }
+            if expanded && cam.lutSelectedName != "None" {
+                HStack(spacing: 10) {
+                    Text("Strength").font(.caption2.bold())
+                    Slider(value: Binding(
+                        get: { draftStrength ?? cam.lutStrength * 100 },
+                        set: { draftStrength = $0 }
+                    ), in: 0...100, onEditingChanged: { editing in
+                        // Commit (and rebuild the cube) once, when the drag ends.
+                        if !editing, let d = draftStrength { cam.setLUTStrength(d / 100); draftStrength = nil }
+                    })
+                    .tint(.orange)
+                    Text("\(Int(draftStrength ?? cam.lutStrength * 100))%")
+                        .font(.caption.bold()).frame(width: 38, alignment: .trailing)
+                    Toggle(isOn: Binding(get: { cam.lutApplyEnabled }, set: { cam.setLUTApply($0) })) {
+                        Text("Bake in").font(.caption2.bold())
+                    }
+                    .toggleStyle(.switch)
+                    .fixedSize()
+                }
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
+            }
+        }
+        .fileImporter(isPresented: $showImporter,
+                      allowedContentTypes: [UTType(filenameExtension: "cube") ?? .data, .plainText, .data],
+                      allowsMultipleSelection: true) { result in
+            if case .success(let urls) = result {
+                for url in urls { cam.importLUT(from: url) }
+            }
+        }
+    }
+}
+
+/// Tools-sheet LUT section: preview toggle + honest Photos-only labelling.
+struct LUTToolsSection: View {
+    @ObservedObject var cam: CameraManager
+    var onPreviewToggle: (Bool) -> Void
+    var body: some View {
+        Toggle("Live LUT preview — see the look on screen while you shoot", isOn: Binding(
+            get: { cam.lutPreviewEnabled },
+            set: { cam.setLUTPreview($0); onPreviewToggle($0) }
+        ))
+        Toggle("Apply LUT to saved photo — the graded photo is what saves (like Blackmagic's Record LUT to Clip)", isOn: Binding(
+            get: { cam.lutApplyEnabled },
+            set: { cam.setLUTApply($0) }
+        ))
+        Text("LUTs apply to PHOTOS. Video records without a LUT — ApexCam doesn't fake it. Import your own .cube files (17/32/33/64-point) from the LUT bar on the main screen; they stay in the app for next time. Built-in looks are generated by the app itself.")
+            .font(.caption).foregroundStyle(.secondary)
+    }
+}
 
 struct HealthPillView: View {
     @ObservedObject var cam: CameraManager

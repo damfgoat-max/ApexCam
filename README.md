@@ -2,7 +2,15 @@
 
 A free, offline, no-ads pro camera app for iPhone (iOS 18), built to be **very user-friendly first, pro second**.
 
-- **AUTO by default** — one big shutter button, one-tap presets: Auto, Sports, Portrait, Night, Vlog, Macro, Video
+## NEW in v4 — LUTs for photos ("the photo version of Blackmagic Camera")
+- **LUT engine for PHOTOS** — the Blackmagic LUT workflow, but for stills: pick a look, see it live on the preview, and the **graded photo is what saves** (baked in, like Blackmagic's *Record LUT to Clip*)
+- **Import your own `.cube` LUTs** from Files (17/32/33/64-point, parsed in-app) — they persist in the app's Documents and stay in the LUT picker across launches
+- **Built-in looks generated in code** (no borrowed files): Warm Golden Hour (the default), Teal & Orange, Kodak Film, Soft Portrait, Classic B&W — rendered to 32-point cubes through `CIColorCube`
+- **Strength slider 0–100%** and an *Apply LUT to saved photo* toggle (ON by default), applied at capture time on a background queue
+- **Default launch mode is All-Day Sports**: 1/1600 fast-shutter priority, auto focus/ISO, −0.3 exposure bias, Warm Golden Hour LUT selected — one tap, all day, especially sports
+- Honest labelling: **LUTs apply to photos only** — video records without a LUT rather than faking it
+
+- **AUTO by default** — one big shutter button, one-tap presets: All-Day, Auto, Sports, Portrait, Night, Vlog, Macro, Video
 - **PRO mode** — big on-screen dials/sliders for ISO, shutter speed, white balance, EV, manual focus, zoom (0.5×/1×/2×/5×)
 - **Subject/motion tracking** — face tracking overlay + tap-to-track, focus follows the subject
 - **Video** — best format your phone supports up to 4K60, 24/30/60 fps + slow-mo format picker, stabilization picker (incl. Cinematic Extended when supported)

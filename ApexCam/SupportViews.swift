@@ -23,12 +23,15 @@ struct OnboardingView: View {
                     pageView(icon: "slider.horizontal.3", title: "Go PRO when you want",
                              text: "Tap PRO for big, simple dials: brightness, shutter speed, ISO, focus and zoom. Tap “Back to Auto” anytime. Your shots save to Photos — and with Dual Save, a backup copy stays in the app too.")
                         .tag(2)
+                    pageView(icon: "camera.filters", title: "LUT looks, baked in",
+                             text: "New in v4: ApexCam opens in All-Day Sports with the Warm Golden Hour LUT on. You see the look live, and the photo that saves already has it — like Blackmagic Camera, but for photos. Import your own .cube LUTs from the LUT bar.")
+                        .tag(3)
                 }
                 .tabViewStyle(.page)
                 Button {
-                    if page < 2 { page += 1 } else { done() }
+                    if page < 3 { page += 1 } else { done() }
                 } label: {
-                    Text(page < 2 ? "Next" : "Start shooting 📸")
+                    Text(page < 3 ? "Next" : "Start shooting 📸")
                         .font(.title3.bold()).frame(maxWidth: .infinity, minHeight: 60)
                         .background(Color.cyan, in: Capsule()).foregroundStyle(.black)
                 }
@@ -53,7 +56,10 @@ struct HelpView: View {
     @Environment(\.dismiss) private var dismiss
     private let rows: [(String, String)] = [
         ("Auto", "The app picks everything. Best for most shots."),
-        ("Sports / Motion", "Uses a very fast shutter (1/1000) so moving people don't blur."),
+        ("All-Day Sports", "The default when the app opens: very fast 1/1600 shutter, auto focus/ISO, slight −0.3 exposure. Point, shoot, all day — especially sports."),
+        ("LUT Looks (Photos)", "A LUT is a colour look, like a film recipe. Pick one in the orange LUT bar and you see it live; the saved photo has the look baked in. Tap Import there to add your own .cube LUT files. Warm Golden Hour is on by default. LUTs apply to photos, not video."),
+        ("LUT Strength", "Tap the orange LUT button to open the strength slider — 100% is the full look, lower mixes in the original colours. 'Bake in' off = photos save ungraded while you still preview the look."),
+        ("Sports / Motion", "Uses a very fast shutter (1/1600) so moving people don't blur."),
         ("Portrait", "Turns on face tracking so the person stays sharp."),
         ("Night", "Slows the shutter and raises ISO so dark scenes come out brighter. Hold still!"),
         ("Vlog", "Front camera, mirror view, smooth video, and a 3-second countdown for photos."),
